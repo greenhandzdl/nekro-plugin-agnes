@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -13,8 +12,6 @@ from nekro_agent.services.plugin.base import SandboxMethodType
 
 from .conf import config, plugin
 from .service import prepare_generation_prompt, validate_size
-
-_DATA_URI_RE = re.compile(r"^data:image/([a-zA-Z+]+);base64,(.+)$", re.DOTALL)
 
 
 def _extract_image_urls(data: Dict[str, Any]) -> List[str]:
@@ -44,10 +41,12 @@ async def generate_image(
     size: str = "1024x768",
     input_image_url: Optional[str] = None,
     translate_prompt: bool = True,
+    send_to_chat: bool = False,
 ) -> str:
     """使用 Agnes AI 生成或编辑图片。
 
     支持文生图和图生图。非英文提示词会自动翻译为英文。
+    生成的图片会自动转换为沙盒文件路径返回给 AI。
 
     Args:
         prompt: 图片描述。建议包含主体、风格、光照、构图、细节。
@@ -56,16 +55,15 @@ async def generate_image(
         size: 尺寸 WIDTHxHEIGHT。默认 "1024x768"。
         input_image_url: 输入图片，支持 HTTP(S) URL 或 Data URI (base64)。
             用于图生图。默认 None（文生图）。
-            例如: "https://example.com/img.png"
-            或: "data:image/png;base64,iVBORw0KGgo..."
         translate_prompt: 是否自动翻译非英文提示词。默认 True。
+        send_to_chat: 是否将生成的图片发送到当前聊天。默认 False。
 
     Returns:
-        图片 URL，或错误信息。
+        沙盒图片文件路径，或错误信息。
 
     Examples:
         generate_image(prompt="A cute orange cat on a windowsill, watercolor style")
-        generate_image(prompt="未来城市，飞行汽车，电影感")
+        generate_image(prompt="未来城市，飞行汽车，电影感", send_to_chat=True)
         generate_image(prompt="Turn into cyberpunk night", input_image_url="https://example.com/img.png")
     """
     try:
@@ -90,9 +88,17 @@ async def generate_image(
             data = await _req(client, "POST", "/v1/images/generations", payload)
 
         urls = _extract_image_urls(data)
-        if urls:
-            return urls[0]
-        return json.dumps(data, ensure_ascii=False, indent=2)
+        if not urls:
+            return json.dumps(data, ensure_ascii=False, indent=2)
+
+        # 转换为沙盒文件路径
+        sandbox_file = await _ctx.fs.mixed_forward_file(urls[0])
+
+        # 发送到聊天
+        if send_to_chat:
+            await _ctx.send_image(sandbox_file)
+
+        return sandbox_file
     except Exception as e:
         logger.exception(f"图片生成失败: {e}")
         return f"图片生成失败: {e}"

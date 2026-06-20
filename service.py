@@ -218,8 +218,10 @@ async def create_video_task(
         created = await _req(client, "POST", "/v1/videos", payload)
 
     api_id = created.get("id")
-    api_video_id = created.get("video_id")
+    api_video_id = created.get("video_id") or created.get("videoId")
     api_st = str(created.get("status", "")) if created.get("status") is not None else None
+
+    logger.info(f"创建任务响应: id={api_id}, video_id={api_video_id}, status={api_st}, 完整响应={json.dumps(created, ensure_ascii=False)[:500]}")
 
     task = VideoTask.create(
         task_id=api_id or task_id, chat_key=ctx.from_chat_key, prompt=prompt,

@@ -43,7 +43,7 @@ def _headers() -> dict[str, str]:
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.TOOL,
+    SandboxMethodType.AGENT,
     name="generate_text",
     description="使用 Agnes AI 生成文本。支持普通模式和流式模式。",
 )

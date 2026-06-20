@@ -218,15 +218,16 @@ async def create_video_task(
         created = await _req(client, "POST", "/v1/videos", payload)
 
     api_id = created.get("id")
+    api_video_id = created.get("video_id")
     api_st = str(created.get("status", "")) if created.get("status") is not None else None
 
     task = VideoTask.create(
-        task_id=task_id, chat_key=ctx.from_chat_key, prompt=prompt,
+        task_id=api_id or task_id, chat_key=ctx.from_chat_key, prompt=prompt,
         reason=reason, model=model, height=height, width=width,
         num_frames=num_frames, frame_rate=frame_rate, image_url=img, image_urls=imgs, mode=mode,
     )
-    if api_id:
-        task.task_id = api_id
+    if api_video_id:
+        task.video_id = api_video_id
     if api_st:
         task.status = TaskStatus.from_api(api_st)
 
@@ -343,19 +344,23 @@ async def update_task_status(task_id: str, status: TaskStatus, **kwargs) -> None
 
 
 async def process_video_task(task_id: str) -> None:
-    """后台轮询视频任务状态"""
+    """后台轮询视频任务状态（使用 video_id 轮询）"""
     gt = await _load_tasks()
     task = gt.get_task(task_id)
     if not task:
         return
 
-    logger.info(f"开始轮询任务 {task_id}: {task.prompt}")
+    # 优先使用 video_id 轮询，回退到 task_id
+    poll_id = task.video_id or task_id
+    poll_url = f"/agnesapi?video_id={poll_id}" if task.video_id else f"/v1/videos/{task_id}"
+
+    logger.info(f"开始轮询任务 {task_id} (poll_id={poll_id}): {task.prompt}")
 
     async with httpx.AsyncClient() as client:
         for i in range(config.MAX_POLL_ATTEMPTS):
             await asyncio.sleep(config.POLL_INTERVAL)
             try:
-                data = await _req(client, "GET", f"/v1/videos/{task_id}")
+                data = await _req(client, "GET", poll_url)
             except Exception as e:
                 logger.warning(f"轮询 {task_id} 第 {i + 1} 次失败: {e}")
                 continue
@@ -375,7 +380,8 @@ async def process_video_task(task_id: str) -> None:
                 await update_task_status(task_id, TaskStatus.FAILED, error_message=str(err))
                 return
 
-            logger.info(f"{task_id}: status={data.get('status')} progress={data.get('progress')} ({i + 1}/{config.MAX_POLL_ATTEMPTS})")
+            progress = data.get("progress")
+            logger.info(f"{task_id}: status={data.get('status')} progress={progress} ({i + 1}/{config.MAX_POLL_ATTEMPTS})")
 
     await update_task_status(task_id, TaskStatus.FAILED, error_message="任务超时")
 

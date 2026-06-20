@@ -42,7 +42,8 @@ class VideoTask(BaseModel):
     chat_key: str
     prompt: str
     reason: Optional[str] = None
-    status: TaskStatus = TaskStatus.PENDING
+    status: TaskStatus = TaskStatus.QUEUED
+    video_id: Optional[str] = None      # API 返回的 video_id，用于轮询
     video_urls: List[str] = Field(default_factory=list)
     error_message: Optional[str] = None
     create_time: int = 0

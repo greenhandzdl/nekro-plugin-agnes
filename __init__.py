@@ -6,330 +6,36 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
-import re
 from typing import Any, Dict, List, Optional
 
 import httpx
+from nekro_agent.api.core import logger
 from nekro_agent.api.schemas import AgentCtx
-from nekro_agent.core import logger
-from nekro_agent.services.plugin.base import ConfigBase, NekroPlugin, SandboxMethodType
-from pydantic import Field
+from nekro_agent.services.plugin.base import SandboxMethodType
 
-# ---------------------------------------------------------------------------
-# 插件注册
-# ---------------------------------------------------------------------------
-
-plugin = NekroPlugin(
-    name="Agnes AI Generation",
-    module_name="agnes_ai_generation",
-    description="通过 Agnes AI API 进行文本、图片和视频生成",
-    version="1.0.0",
-    author="greenhandzdl",
-    url="https://github.com/greenhandzdl/nekro-plugin-agnes",
+from .conf import config, plugin
+from .models import TaskStatus
+from .service import (
+    create_video_task,
+    extract_image_urls,
+    extract_video_urls,
+    get_video_task,
+    get_video_task_api,
+    prepare_generation_prompt,
+    request_json,
+    validate_size,
+    validate_video_args,
 )
-
-# ---------------------------------------------------------------------------
-# 配置
-# ---------------------------------------------------------------------------
-
-SIZE_RE = re.compile(r"^[1-9]\d*x[1-9]\d*$")
-
-
-@plugin.mount_config()
-class AgnesConfig(ConfigBase):
-    """Agnes AI 插件配置"""
-
-    API_KEY: str = Field(
-        default="",
-        title="Agnes API Key",
-        description="Agnes AI 平台的 API Key，留空则从环境变量读取",
-    )
-    BASE_URL: str = Field(
-        default="https://apihub.agnes-ai.com",
-        title="API 基础地址",
-        description="Agnes API 的基础 URL",
-    )
-    TIMEOUT: int = Field(
-        default=120,
-        title="请求超时时间",
-        description="API 请求的超时时间（秒）",
-    )
-    config.TEXT_MODEL: str = Field(
-        default="agnes-2.0-flash",
-        title="文本模型",
-        description="文本生成使用的模型名称",
-    )
-    config.IMAGE_MODEL: str = Field(
-        default="agnes-image-2.1-flash",
-        title="图片模型",
-        description="图片生成/编辑使用的模型名称",
-    )
-    config.VIDEO_MODEL: str = Field(
-        default="agnes-video-v2.0",
-        title="视频模型",
-        description="视频生成使用的模型名称",
-    )
-
-
-config: AgnesConfig = plugin.get_config(AgnesConfig)
-
-# ---------------------------------------------------------------------------
-# 内部工具函数
-# ---------------------------------------------------------------------------
-
-
-def _resolve_api_key() -> str:
-    """获取 API Key：优先使用配置，回退到环境变量。"""
-    if config.API_KEY:
-        return config.API_KEY
-    for name in ("AGNES_API_KEY", "AGNES_API_TOKEN", "APIHUB_AGNES_API_KEY"):
-        value = os.environ.get(name)
-        if value:
-            return value
-    raise RuntimeError(
-        "未找到 API Key。请在插件配置中设置 API_KEY，"
-        "或设置环境变量 AGNES_API_KEY / AGNES_API_TOKEN / APIHUB_AGNES_API_KEY。"
-    )
 
 
 def _headers() -> dict[str, str]:
+    from .service import _resolve_api_key
+
     return {
         "Authorization": f"Bearer {_resolve_api_key()}",
         "Content-Type": "application/json",
     }
-
-
-async def _request_json(
-    client: httpx.AsyncClient,
-    method: str,
-    path: str,
-    payload: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """发送 JSON 请求并返回解析后的响应。"""
-    url = f"{config.BASE_URL}{path}"
-    try:
-        if method == "GET":
-            resp = await client.get(url, headers=_headers(), timeout=config.TIMEOUT)
-        else:
-            resp = await client.post(
-                url,
-                json=payload,
-                headers=_headers(),
-                timeout=config.TIMEOUT,
-            )
-        resp.raise_for_status()
-        text = resp.text
-        return json.loads(text) if text else {}
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text if exc.response is not None else str(exc)
-        raise RuntimeError(f"HTTP {exc.response.status_code} from {path}: {detail}") from exc
-    except httpx.RequestError as exc:
-        raise RuntimeError(f"请求 {path} 失败: {exc}") from exc
-
-
-async def _request_text(
-    client: httpx.AsyncClient,
-    method: str,
-    path: str,
-    payload: Optional[Dict[str, Any]] = None,
-) -> str:
-    """发送请求并返回原始文本。"""
-    url = f"{config.BASE_URL}{path}"
-    try:
-        if method == "GET":
-            resp = await client.get(url, headers=_headers(), timeout=config.TIMEOUT)
-        else:
-            resp = await client.post(
-                url,
-                json=payload,
-                headers=_headers(),
-                timeout=config.TIMEOUT,
-            )
-        resp.raise_for_status()
-        return resp.text
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text if exc.response is not None else str(exc)
-        raise RuntimeError(f"HTTP {exc.response.status_code} from {path}: {detail}") from exc
-    except httpx.RequestError as exc:
-        raise RuntimeError(f"请求 {path} 失败: {exc}") from exc
-
-
-async def _stream_summary(client: httpx.AsyncClient, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """解析流式文本响应，聚合内容。"""
-    raw_chunks: List[str] = []
-    event_count = 0
-    done = False
-    content_parts: List[str] = []
-
-    url = f"{config.BASE_URL}/v1/chat/completions"
-    try:
-        async with client.stream(
-            "POST",
-            url,
-            json=payload,
-            headers=_headers(),
-            timeout=config.TIMEOUT,
-        ) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line.removeprefix("data:").strip()
-                raw_chunks.append(data)
-                if data == "[DONE]":
-                    done = True
-                elif data:
-                    event_count += 1
-                    try:
-                        event = json.loads(data)
-                        delta = event["choices"][0].get("delta", {})
-                        content = delta.get("content")
-                        if isinstance(content, str):
-                            content_parts.append(content)
-                    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-                        continue
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text if exc.response is not None else str(exc)
-        raise RuntimeError(f"HTTP {exc.response.status_code} from /v1/chat/completions: {detail}") from exc
-    except httpx.RequestError as exc:
-        raise RuntimeError(f"流式请求失败: {exc}") from exc
-
-    raw_text = "\n".join(raw_chunks)
-    return {
-        "type": "text-stream",
-        "content": "".join(content_parts) or None,
-        "events": event_count,
-        "done": done,
-        "raw_prefix": raw_text[:200],
-    }
-
-
-def _needs_english_translation(prompt: str) -> bool:
-    """检测提示词是否包含非 ASCII 字符（需要翻译为英文）。"""
-    return any(ord(ch) > 127 for ch in prompt)
-
-
-async def _translate_prompt_to_english(client: httpx.AsyncClient, prompt: str) -> str:
-    """调用 Agnes 文本模型将非英文提示词翻译为英文。"""
-    payload = {
-        "model": config.TEXT_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Translate the user's image/video generation prompt into fluent English. "
-                    "Preserve all concrete visual details, style words, camera motion, lighting, "
-                    "composition constraints, and negative instructions. Return only the English prompt."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0,
-        "max_tokens": 800,
-    }
-    data = await _request_json(client, "POST", "/v1/chat/completions", payload)
-    try:
-        translated = data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"提示词翻译失败: {json.dumps(data, ensure_ascii=False)}") from exc
-    if not translated:
-        raise RuntimeError("提示词翻译失败: 翻译结果为空")
-    return translated
-
-
-async def _prepare_generation_prompt(
-    client: httpx.AsyncClient,
-    prompt: str,
-    translate: bool = True,
-) -> tuple[str, Optional[str]]:
-    """准备生成提示词，必要时翻译为英文。"""
-    if translate and _needs_english_translation(prompt):
-        translated = await _translate_prompt_to_english(client, prompt)
-        return translated, translated
-    return prompt, None
-
-
-def _extract_image_urls(data: Dict[str, Any]) -> List[str]:
-    """从图片生成响应中提取 URL 列表。"""
-    urls: List[str] = []
-    if isinstance(data.get("url"), str):
-        urls.append(data["url"])
-    if isinstance(data.get("image_url"), str):
-        urls.append(data["image_url"])
-    if isinstance(data.get("data"), list):
-        for item in data["data"]:
-            if isinstance(item, dict):
-                for key in ("url", "image_url"):
-                    if isinstance(item.get(key), str):
-                        urls.append(item[key])
-    return urls
-
-
-def _extract_video_urls(data: Dict[str, Any]) -> List[str]:
-    """从视频响应中提取 URL 列表。"""
-    urls: List[str] = []
-    for key in ("video_url", "url", "remixed_from_video_id"):
-        value = data.get(key)
-        if isinstance(value, str) and value.startswith(("http://", "https://")):
-            urls.append(value)
-    if isinstance(data.get("data"), list):
-        for item in data["data"]:
-            if isinstance(item, dict):
-                urls.extend(_extract_video_urls(item))
-    # 去重保序
-    return list(dict.fromkeys(urls))
-
-
-def _validate_size(value: Optional[str]) -> None:
-    """校验图片尺寸格式。"""
-    if value and not SIZE_RE.match(value):
-        raise ValueError(f"无效尺寸: {value}。期望格式为 WIDTHxHEIGHT，例如 1024x768。")
-
-
-def _validate_video_args(
-    num_frames: Optional[int],
-    frame_rate: Optional[float],
-    height: Optional[int],
-    width: Optional[int],
-) -> None:
-    """校验视频参数。"""
-    if num_frames is not None:
-        if num_frames > 441 or (num_frames - 1) % 8 != 0:
-            raise ValueError("无效 num_frames: 必须 <= 441 且满足 8n+1，例如 81 或 121。")
-    if frame_rate is not None and not (1 <= frame_rate <= 60):
-        raise ValueError("无效 frame_rate: 支持范围为 1-60。")
-    for name, val in [("height", height), ("width", width)]:
-        if val is not None and val <= 0:
-            raise ValueError(f"无效 {name}: 必须为正整数。")
-
-
-async def _poll_video(
-    client: httpx.AsyncClient,
-    task_id: str,
-    timeout: int = 900,
-    interval: int = 10,
-) -> Dict[str, Any]:
-    """轮询视频任务直到完成或超时。"""
-    deadline = asyncio.get_event_loop().time() + timeout
-    last: Dict[str, Any] = {}
-    while asyncio.get_event_loop().time() < deadline:
-        last = await _request_json(client, "GET", f"/v1/videos/{task_id}")
-        if last.get("error"):
-            raise RuntimeError(f"视频任务 {task_id} 返回错误: {json.dumps(last, ensure_ascii=False)}")
-        status = str(last.get("status", "")).lower()
-        progress = last.get("progress")
-        logger.info(f"视频 {task_id}: status={status} progress={progress}")
-        if status in {"completed", "failed"}:
-            return last
-        await asyncio.sleep(interval)
-    raise RuntimeError(
-        f"等待视频任务 {task_id} 超时。最后响应: {json.dumps(last, ensure_ascii=False)}"
-    )
-
 
 # ---------------------------------------------------------------------------
 # 工具方法：文本生成
@@ -384,9 +90,47 @@ async def generate_text(
     try:
         async with httpx.AsyncClient() as client:
             if stream:
-                result = await _stream_summary(client, payload)
+                # 流式模式：手动解析 SSE
+                url = f"{config.BASE_URL}/v1/chat/completions"
+                content_parts: List[str] = []
+                event_count = 0
+                done = False
+                raw_chunks: List[str] = []
+                async with client.stream(
+                    "POST", url, json=payload,
+                    headers=_headers(), timeout=config.TIMEOUT,
+                ) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line.removeprefix("data:").strip()
+                        raw_chunks.append(data)
+                        if data == "[DONE]":
+                            done = True
+                        elif data:
+                            event_count += 1
+                            try:
+                                event = json.loads(data)
+                                delta = event["choices"][0].get("delta", {})
+                                content = delta.get("content")
+                                if isinstance(content, str):
+                                    content_parts.append(content)
+                            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                                continue
+                raw_text = "\n".join(raw_chunks)
+                result = {
+                    "type": "text-stream",
+                    "content": "".join(content_parts) or None,
+                    "events": event_count,
+                    "done": done,
+                    "raw_prefix": raw_text[:200],
+                }
                 return json.dumps(result, ensure_ascii=False, indent=2)
-            data = await _request_json(client, "POST", "/v1/chat/completions", payload)
+
+            # 普通模式
+            data = await request_json(client, "POST", "/v1/chat/completions", payload)
         content = data["choices"][0]["message"].get("content") if data.get("choices") else None
         if content:
             return content
@@ -433,15 +177,13 @@ async def generate_image(
         generate_image(prompt="一座高信息密度的未来城市集市，拥挤人群，飞行汽车，全息招牌，电影感写实风格")
     """
     try:
-        _validate_size(size)
+        validate_size(size)
     except ValueError as e:
         return f"参数错误: {e}"
 
     try:
         async with httpx.AsyncClient() as client:
-            prepared_prompt, translated = await _prepare_generation_prompt(
-                client, prompt, translate_prompt
-            )
+            prepared_prompt, translated = await prepare_generation_prompt(client, prompt, translate_prompt)
 
             payload: Dict[str, Any] = {
                 "model": config.IMAGE_MODEL,
@@ -455,9 +197,9 @@ async def generate_image(
                 extra["image"] = input_image_url
             payload["extra_body"] = extra
 
-            data = await _request_json(client, "POST", "/v1/images/generations", payload)
+            data = await request_json(client, "POST", "/v1/images/generations", payload)
 
-        urls = _extract_image_urls(data)
+        urls = extract_image_urls(data)
         mode = "image-to-image" if input_image_url else "text-to-image"
         result = {
             "type": mode,
@@ -479,7 +221,7 @@ async def generate_image(
 @plugin.mount_sandbox_method(
     SandboxMethodType.AGENT,
     name="create_video",
-    description="使用 Agnes AI 创建视频任务。支持文生视频、图生视频、多图视频和关键帧动画。",
+    description="使用 Agnes AI 创建视频任务。支持文生视频、图生视频、多图视频和关键帧动画。任务在后台异步处理，完成后自动通知。",
 )
 async def create_video(
     _ctx: AgentCtx,
@@ -495,13 +237,12 @@ async def create_video(
     seed: Optional[int] = None,
     negative_prompt: Optional[str] = None,
     translate_prompt: bool = True,
-    poll: bool = False,
-    poll_timeout: int = 900,
-    poll_interval: int = 10,
 ) -> str:
     """创建 Agnes AI 视频生成任务。
 
-    Agnes 视频 API 是异步的：先创建任务，再通过 get_video 查询结果。
+    Agnes 视频 API 是异步的：创建任务后立即返回 task_id，
+    后台轮询状态直到完成，完成后自动通知用户。
+    使用 get_video 可随时查询任务状态。
 
     Args:
         prompt: 视频描述提示词。非英文会自动翻译。
@@ -516,100 +257,62 @@ async def create_video(
         seed: 随机种子，用于可重复生成。
         negative_prompt: 负面提示词。
         translate_prompt: 是否自动翻译非英文提示词。默认开启。
-        poll: 是否轮询等待结果。默认 False（仅创建任务）。
-        poll_timeout: 轮询超时时间（秒）。默认 900。
-        poll_interval: 轮询间隔（秒）。默认 10。
 
     Returns:
-        str: 包含任务 ID、状态和（若已完成）视频 URL 的 JSON 字符串。
+        str: 包含任务 ID 和初始状态的 JSON 字符串。
 
     Example:
         文生视频:
-        create_video(prompt="A cinematic shot of a cat walking on the beach at sunset", poll=True)
+        create_video(prompt="A cinematic shot of a cat walking on the beach at sunset")
         图生视频:
-        create_video(prompt="Animate subtle camera movement", image_url="https://example.com/image.png", poll=True)
+        create_video(prompt="Animate subtle camera movement", image_url="https://example.com/image.png")
         关键帧动画:
         create_video(prompt="Smooth transition between keyframes",
                      image_urls=["https://example.com/a.png", "https://example.com/b.png"],
-                     mode="keyframes", poll=True)
+                     mode="keyframes")
     """
     try:
-        _validate_video_args(num_frames, frame_rate, height, width)
+        validate_video_args(num_frames, frame_rate, height, width)
     except ValueError as e:
         return f"参数错误: {e}"
 
     try:
         async with httpx.AsyncClient() as client:
-            prepared_prompt, translated = await _prepare_generation_prompt(
+            prepared_prompt, translated = await prepare_generation_prompt(
                 client, prompt, translate_prompt
             )
 
-            payload: Dict[str, Any] = {
-                "model": config.VIDEO_MODEL,
-                "prompt": prepared_prompt,
-                "height": height,
-                "width": width,
-                "num_frames": num_frames,
-                "frame_rate": frame_rate,
-            }
-            if num_inference_steps is not None:
-                payload["num_inference_steps"] = num_inference_steps
-            if seed is not None:
-                payload["seed"] = seed
-            if negative_prompt:
-                payload["negative_prompt"] = negative_prompt
+        task_id = f"task_{int(__import__('time').time() * 1000)}"
 
-            # 处理图片输入
-            if image_urls and len(image_urls) >= 2:
-                payload["extra_body"] = {"image": image_urls}
-                if mode:
-                    payload["extra_body"]["mode"] = mode
-            elif image_url:
-                if mode:
-                    payload["extra_body"] = {"image": image_url, "mode": mode}
-                else:
-                    payload["image"] = image_url
+        task = await create_video_task(
+            task_id=task_id,
+            prompt=prepared_prompt,
+            ctx=_ctx,
+            translated_prompt=translated,
+            model=config.VIDEO_MODEL,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=num_inference_steps,
+            seed=seed,
+            negative_prompt=negative_prompt,
+            image_url=image_url,
+            image_urls=image_urls,
+            mode=mode,
+        )
 
-            # 创建任务
-            created = await _request_json(client, "POST", "/v1/videos", payload)
-            task_id = created.get("id")
-            status = str(created.get("status", "")) if created.get("status") is not None else None
-
-            result: Dict[str, Any] = {
-                "type": "video-task",
-                "task_id": task_id,
-                "status": status,
-                "prompt_used": prepared_prompt,
-                "translated_prompt": translated,
-            }
-
-            if not poll:
-                result["next_steps"] = [
-                    f"调用 get_video(task_id=\"{task_id}\") 查询视频状态",
-                ]
-                return json.dumps(result, ensure_ascii=False, indent=2)
-
-            # 轮询等待
-            if not task_id:
-                return json.dumps(
-                    {
-                        "type": "video-task",
-                        "error": f"创建响应中未包含 task_id: {json.dumps(created, ensure_ascii=False)}",
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-
-            logger.info(f"视频任务 {task_id} 已创建，开始轮询...")
-            data = await _poll_video(client, str(task_id), poll_timeout, poll_interval)
-            urls = _extract_video_urls(data)
-            result.update({
-                "type": "video-result",
-                "status": str(data.get("status", "")),
-                "urls": urls,
-                "raw": data,
-            })
-            return json.dumps(result, ensure_ascii=False, indent=2)
+        result = {
+            "type": "video-task",
+            "task_id": task.task_id,
+            "status": task.status.value,
+            "prompt_used": prepared_prompt,
+            "translated_prompt": translated,
+            "next_steps": [
+                f"调用 get_video(task_id=\"{task.task_id}\") 查询视频状态",
+            ],
+        }
+        return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.exception(f"视频创建失败: {e}")
         return f"视频创建失败: {e}"
@@ -623,40 +326,68 @@ async def create_video(
 @plugin.mount_sandbox_method(
     SandboxMethodType.AGENT,
     name="get_video",
-    description="查询 Agnes AI 视频任务的状态和结果。",
+    description="查询 Agnes AI 视频任务的状态和结果。优先从本地缓存获取，force_refresh=true 时从 API 获取最新状态。",
 )
 async def get_video(
     _ctx: AgentCtx,
     task_id: str,
+    force_refresh: bool = False,
 ) -> str:
     """查询 Agnes AI 视频任务的状态和结果。
 
     Args:
         task_id: 视频任务 ID（创建视频时返回）。
+        force_refresh: 是否强制从 API 获取最新状态。默认 False（使用本地缓存）。
 
     Returns:
         str: 包含任务状态、视频 URL（如果已完成）的 JSON 字符串。
 
     Example:
         get_video(task_id="task_123456")
+        get_video(task_id="task_123456", force_refresh=True)
     """
     try:
+        # 优先从本地缓存获取
+        task = await get_video_task(task_id)
+
+        # 如果本地有缓存且任务已完成/失败，且非强制刷新，直接返回
+        if task and not force_refresh:
+            if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+                result = {
+                    "type": "video-result",
+                    "task_id": task.task_id,
+                    "status": task.status.value,
+                    "urls": task.video_urls,
+                }
+                if task.error_message:
+                    result["error_message"] = task.error_message
+                if not task.video_urls:
+                    result["next_steps"] = [f"调用 get_video(task_id=\"{task_id}\") 继续查询"]
+                return json.dumps(result, ensure_ascii=False, indent=2)
+
+        # 从 API 获取最新状态
         async with httpx.AsyncClient() as client:
-            data = await _request_json(client, "GET", f"/v1/videos/{task_id}")
+            data = await request_json(client, "GET", f"/v1/videos/{task_id}")
 
         if data.get("error"):
             return json.dumps(
                 {"type": "video-error", "task_id": task_id, "error": data["error"]},
-                ensure_ascii=False,
-                indent=2,
+                ensure_ascii=False, indent=2,
             )
 
-        urls = _extract_video_urls(data)
-        status = str(data.get("status", "")) if data.get("status") is not None else None
-        result: Dict[str, Any] = {
+        urls = extract_video_urls(data)
+        status_str = str(data.get("status", "")).lower()
+        try:
+            status = TaskStatus(status_str)
+        except ValueError:
+            status_str_val = status_str
+        else:
+            status_str_val = status.value
+
+        result = {
             "type": "video-result",
             "task_id": task_id,
-            "status": status,
+            "status": status_str_val,
             "urls": urls,
         }
         if not urls:

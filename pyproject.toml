@@ -16,7 +16,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["__init__.py"]
+only-include = ["*.py"]
 
 [tool.black]
 line-length = 128

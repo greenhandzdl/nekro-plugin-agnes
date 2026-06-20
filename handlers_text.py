@@ -66,6 +66,9 @@ async def generate_text(
         Data URI:
         generate_text(prompt="这是什么", images=["data:image/png;base64,iVBORw0KGgo..."])
     """
+    if config.DISABLE_TEXT_GENERATION:
+        return "文本生成功能当前不可用，请稍后再试。"
+
     messages: List[Dict[str, Any]] = []
     if system:
         messages.append({"role": "system", "content": system})

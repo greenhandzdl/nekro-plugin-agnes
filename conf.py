@@ -55,6 +55,11 @@ class AgnesConfig(ConfigBase):
         title="最大轮询次数",
         description="视频任务状态查询的最大次数，默认 60 次（约 10 分钟）",
     )
+    DISABLE_TEXT_GENERATION: bool = Field(
+        default=False,
+        title="禁用文本生成",
+        description="开启后 generate_text 将始终返回不可用提示，适用于只需要图片/视频生成的场景",
+    )
 
 
 # 获取配置

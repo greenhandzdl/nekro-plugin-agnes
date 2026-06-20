@@ -90,8 +90,8 @@ async def create_video(
             translated=translated, model=config.VIDEO_MODEL,
             height=height, width=width, num_frames=num_frames, frame_rate=frame_rate,
             nis=num_inference_steps, seed=seed,
-            negative_prompt=negative_prompt, image_url=image_url,
-            image_urls=image_urls, mode=mode,
+            neg=negative_prompt, img=image_url,
+            imgs=image_urls, mode=mode,
         )
 
         return json.dumps({

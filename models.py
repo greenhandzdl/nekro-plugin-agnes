@@ -87,6 +87,10 @@ class TaskStoreData(BaseModel):
         self.task_counter += 1
         return f"task_{self.task_counter:06d}"
 
+    def add_task(self, task: VideoTask) -> None:
+        """添加任务"""
+        self.tasks[task.task_id] = task
+
     def get_task(self, task_id: str) -> Optional[VideoTask]:
         """获取任务"""
         return self.tasks.get(task_id)

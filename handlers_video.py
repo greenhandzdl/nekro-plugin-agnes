@@ -17,6 +17,7 @@ from .service import (
     create_video_task,
     extract_video_urls,
     get_video_task,
+    has_processing_task,
     prepare_generation_prompt,
     validate_video_args,
 )
@@ -47,6 +48,8 @@ async def create_video(
     API 是异步的：创建后立即返回 task_id，后台自动轮询，
     完成后通过系统消息通知用户。可随时调用 get_video 查询。
 
+    如果当前会话已有正在进行的视频任务，将拒绝创建新任务。
+
     num_frames 必须满足 8n+1 且 <= 441（如 81, 89, 121）。
 
     Args:
@@ -74,6 +77,20 @@ async def create_video(
         create_video(prompt="Smooth keyframe transition",
                      image_urls=["https://a.png", "https://b.png"], mode="keyframes")
     """
+    # 检查是否有正在进行的任务
+    if not _ctx.chat_key:
+        return "无法创建视频任务：未获取到聊天会话信息。"
+
+    existing = await has_processing_task(_ctx.chat_key)
+    if existing:
+        return (
+            f"当前已有正在进行的视频任务，请等待完成后再创建新任务。\n"
+            f"任务ID: {existing.task_id}\n"
+            f"状态: {existing.status.value}\n"
+            f"提示词: {existing.prompt}\n"
+            f"可使用 get_video(task_id=\"{existing.task_id}\") 查询进度。"
+        )
+
     try:
         validate_video_args(num_frames, frame_rate, height, width)
     except ValueError as e:

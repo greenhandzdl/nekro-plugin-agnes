@@ -208,6 +208,7 @@ async def create_video_task(
         translated_prompt=translated, model=model, height=height, width=width,
         num_frames=num_frames, frame_rate=frame_rate, image_url=img, image_urls=imgs, mode=mode,
     )
+    # 使用 API 返回的 id（可能与本地 task_id 不同）
     if api_id:
         task.task_id = api_id
     if api_st:
@@ -215,52 +216,55 @@ async def create_video_task(
 
     sd.add_task(task)
     await _save(sd)
-    asyncio.create_task(_poll(task.task_id))
+
+    # 启动后台轮询，使用 API 返回的 task_id
+    asyncio.create_task(_process_video_task(task.task_id))
+
     return task
 
 
 # ---------------------------------------------------------------------------
-# 后台轮询
+# 后台轮询（参考 tongyi_wanx 架构）
 # ---------------------------------------------------------------------------
 
 
-async def _poll(tid: str) -> None:
-    """后台轮询，完成后通知。"""
+async def _process_video_task(task_id: str) -> None:
+    """后台轮询视频任务状态，完成后通知用户。"""
     sd = await _load()
-    task = sd.get_task(tid)
+    task = sd.get_task(task_id)
     if not task:
         return
 
-    logger.info(f"轮询 {tid}: {task.prompt}")
+    logger.info(f"开始轮询任务 {task_id}: {task.prompt}")
 
     async with httpx.AsyncClient() as client:
         for i in range(config.MAX_POLL_ATTEMPTS):
             await asyncio.sleep(config.POLL_INTERVAL)
             try:
-                data = await _req(client, "GET", f"/v1/videos/{tid}")
+                data = await _req(client, "GET", f"/v1/videos/{task_id}")
             except Exception as e:
-                logger.warning(f"轮询 {tid} 第 {i + 1} 次失败: {e}")
+                logger.warning(f"轮询 {task_id} 第 {i + 1} 次失败: {e}")
                 continue
 
             if data.get("error"):
-                await _fail(tid, task.chat_key, json.dumps(data["error"], ensure_ascii=False))
+                await _fail(task_id, task.chat_key, json.dumps(data["error"], ensure_ascii=False))
                 return
 
             st = TaskStatus.from_api(data.get("status", ""))
 
             if st == TaskStatus.COMPLETED:
                 urls = extract_video_urls(data)
-                await _upd(tid, TaskStatus.COMPLETED, video_urls=urls)
-                await _notify(tid, task.chat_key, urls=urls)
+                await _upd(task_id, TaskStatus.COMPLETED, video_urls=urls)
+                await _notify(task_id, task.chat_key, urls=urls)
                 return
             if st == TaskStatus.FAILED:
                 err = data.get("error_message") or data.get("message") or "未知错误"
-                await _fail(tid, task.chat_key, str(err))
+                await _fail(task_id, task.chat_key, str(err))
                 return
 
-            logger.info(f"{tid}: status={data.get('status')} progress={data.get('progress')} ({i + 1}/{config.MAX_POLL_ATTEMPTS})")
+            logger.info(f"{task_id}: status={data.get('status')} progress={data.get('progress')} ({i + 1}/{config.MAX_POLL_ATTEMPTS})")
 
-    await _fail(tid, task.chat_key, "任务超时")
+    await _fail(task_id, task.chat_key, "任务超时")
 
 
 async def _upd(tid: str, status: TaskStatus, **kw) -> None:
@@ -295,3 +299,12 @@ async def _notify(tid: str, chat_key: str, urls: Optional[List[str]] = None, err
 async def get_video_task(tid: str) -> Optional[VideoTask]:
     s = await _load()
     return s.get_task(tid)
+
+
+async def has_processing_task(chat_key: str) -> Optional[VideoTask]:
+    """检查指定会话是否有正在进行的视频任务。"""
+    sd = await _load()
+    for task in sd.tasks.values():
+        if task.chat_key == chat_key and task.status in (TaskStatus.QUEUED, TaskStatus.IN_PROGRESS):
+            return task
+    return None

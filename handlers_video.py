@@ -172,7 +172,6 @@ async def create_video(
     _ctx: AgentCtx,
     prompt: str,
     reason: str = "",
-    image_url: Optional[str] = None,
     image_urls: Optional[List[str]] = None,
     mode: Optional[str] = None,
     height: int = 768,
@@ -217,8 +216,7 @@ async def create_video(
             reason=reason or None, model=config.VIDEO_MODEL,
             height=height, width=width, num_frames=num_frames, frame_rate=frame_rate,
             nis=num_inference_steps, seed=seed,
-            neg=negative_prompt, img=image_url,
-            imgs=image_urls, mode=mode,
+            neg=negative_prompt, imgs=image_urls, mode=mode,
         )
 
         approval_msg = " (需要管理员审批)" if config.REQUIRE_ADMIN_APPROVAL else ""

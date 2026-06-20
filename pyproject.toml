@@ -5,7 +5,7 @@ description = "Agnes AI 文本、图片、视频生成插件"
 authors = [{ name = "greenhandzdl", email = "greenhandzdl@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.10,<3.12"
-dependencies = ["nekro-agent>=2.0.0", "httpx"]
+dependencies = ["nekro-agent>=2.0.0", "httpx", "nonebot2", "nonebot2[fastapi]"]
 
 [project.urls]
 Repository = "https://github.com/Yacey/agnes-ai-generation-skill"

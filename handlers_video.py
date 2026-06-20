@@ -3,15 +3,22 @@
 方法类型:
 - BEHAVIOR: 创建/取消/审批/拒绝（Agent 触发，返回描述性文本）
 - TOOL: 查询/列表/详情（返回结构化结果）
+- on_command: 管理员命令（/agnes_y, /agnes_n, /agnes_list, /agnes_info）
 """
 
 import time
 from typing import List
 
+from nekro_agent.adapters.onebot_v11.matchers.command import command_guard, finish_with
 from nekro_agent.api.core import logger
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.services.plugin.base import SandboxMethodType
 from nekro_agent.tools.common_util import limited_text_output
+from nonebot import on_command
+from nonebot.adapters import Bot, Message
+from nonebot.adapters.onebot.v11 import MessageEvent
+from nonebot.matcher import Matcher
+from nonebot.params import CommandArg
 
 from .conf import config, plugin
 from .models import TaskStatus
@@ -303,6 +310,122 @@ async def get_video_task_info(_ctx: AgentCtx, task_id: str) -> str:
     if not task:
         return f"任务 {task_id} 不存在。"
     return f"任务详情:\n\n{format_task_info(task)}"
+
+
+# ---------------------------------------------------------------------------
+# 管理员命令（on_command）— 对齐 tongyi_wanx
+# ---------------------------------------------------------------------------
+
+
+@on_command("agnes_y", aliases={"agnes-y"}, priority=5, block=True).handle()
+async def handle_approve(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Message = CommandArg()):
+    """批准视频生成任务"""
+    username, cmd_content, chat_key, chat_type = await command_guard(event, bot, arg, matcher)
+
+    from .service import _load_tasks
+    gt = await _load_tasks()
+    pending = [t for t in gt.get_all_tasks() if t.status == TaskStatus.PENDING]
+
+    if not cmd_content or not cmd_content.strip():
+        if not pending:
+            await finish_with(matcher, message="当前没有待审批的任务")
+        if len(pending) == 1:
+            task_id = pending[0].task_id
+        else:
+            ids = ", ".join(t.task_id for t in pending)
+            await finish_with(matcher, message=f"有多个待审批任务，请指定任务ID：{ids}")
+    else:
+        task_id = cmd_content.strip()
+
+    task = gt.get_task(task_id)
+    if not task:
+        await finish_with(matcher, message=f"任务 {task_id} 不存在")
+
+    success = await approve_video_task(task_id)
+    if success:
+        await finish_with(matcher, message=f"已批准任务 {task_id}，开始执行视频生成")
+    else:
+        await finish_with(matcher, message=f"批准任务 {task_id} 失败，请检查任务状态")
+
+
+@on_command("agnes_n", aliases={"agnes-n"}, priority=5, block=True).handle()
+async def handle_reject(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Message = CommandArg()):
+    """拒绝视频生成任务"""
+    username, cmd_content, chat_key, chat_type = await command_guard(event, bot, arg, matcher)
+
+    from .service import _load_tasks
+    gt = await _load_tasks()
+    pending = [t for t in gt.get_all_tasks() if t.status == TaskStatus.PENDING]
+
+    if not cmd_content or not cmd_content.strip():
+        if not pending:
+            await finish_with(matcher, message="当前没有待审批的任务")
+        if len(pending) == 1:
+            task_id = pending[0].task_id
+        else:
+            ids = ", ".join(t.task_id for t in pending)
+            await finish_with(matcher, message=f"有多个待审批任务，请指定任务ID：{ids}")
+    else:
+        task_id = cmd_content.strip()
+
+    task = gt.get_task(task_id)
+    if not task:
+        await finish_with(matcher, message=f"任务 {task_id} 不存在")
+
+    success = await reject_video_task(task_id)
+    if success:
+        await finish_with(matcher, message=f"已拒绝任务 {task_id}")
+    else:
+        await finish_with(matcher, message=f"拒绝任务 {task_id} 失败，请检查任务状态")
+
+
+@on_command("agnes_list", aliases={"agnes-list", "agnes-ls", "agnes_ls"}, priority=5, block=True).handle()
+async def handle_list(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Message = CommandArg()):
+    """查询视频任务列表"""
+    username, cmd_content, chat_key, chat_type = await command_guard(event, bot, arg, matcher)
+
+    try:
+        page = 1
+        if cmd_content:
+            page = int(cmd_content.strip())
+            if page < 1:
+                page = 1
+    except ValueError:
+        await finish_with(matcher, message="页码必须是一个正整数")
+
+    tasks_page, total_pages, total_tasks = await get_tasks_page(page)
+    if not tasks_page:
+        await finish_with(matcher, message="没有找到任何任务")
+
+    info = f"任务列表 (第 {page}/{total_pages} 页，共 {total_tasks} 个任务):\n\n"
+    for i, task in enumerate(tasks_page, 1):
+        t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task.create_time))
+        info += (
+            f"{i}. 任务ID: {task.task_id}\n"
+            f"   提示词: {task.prompt}\n"
+            f"   状态: {task.status.value}\n"
+            f"   创建时间: {t}\n\n"
+        )
+    if page < total_pages:
+        info += f"使用 /agnes-list {page + 1} 查看下一页"
+
+    await finish_with(matcher, message=info)
+
+
+@on_command("agnes_info", aliases={"agnes-info", "agnes-i", "agnes_i"}, priority=5, block=True).handle()
+async def handle_info(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Message = CommandArg()):
+    """查询任务详情"""
+    username, cmd_content, chat_key, chat_type = await command_guard(event, bot, arg, matcher)
+
+    if not cmd_content:
+        await finish_with(matcher, message="请指定要查询的任务ID")
+
+    task_id = cmd_content.strip()
+    task = await get_video_task(task_id)
+    if not task:
+        await finish_with(matcher, message=f"任务 {task_id} 不存在")
+
+    await finish_with(matcher, message=f"任务详情:\n\n{format_task_info(task)}")
 
 
 # ---------------------------------------------------------------------------

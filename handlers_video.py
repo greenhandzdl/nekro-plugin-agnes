@@ -53,8 +53,8 @@ async def create_video(
         prompt: 视频描述。建议包含主体、动作、场景、风格、镜头、光照。
             英文效果更好，中文自动翻译。
             例如: "A cinematic shot of a cat walking on the beach at sunset"
-        image_url: 单张输入图片 URL，用于图生视频。默认 None。
-        image_urls: 多张输入图片 URL，用于多图视频或关键帧动画。默认 None。
+        image_url: 单张输入图片，支持 URL 或 Data URI (base64)。用于图生视频。默认 None。
+        image_urls: 多张输入图片，支持 URL 或 Data URI。用于多图视频或关键帧动画。默认 None。
         mode: 生成模式。"ti2vid"(图生视频) 或 "keyframes"(关键帧动画)。默认 None。
         height: 视频高度。默认 768。
         width: 视频宽度。默认 1152。

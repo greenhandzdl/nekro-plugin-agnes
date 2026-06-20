@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -12,6 +13,8 @@ from nekro_agent.services.plugin.base import SandboxMethodType
 
 from .conf import config, plugin
 from .service import prepare_generation_prompt, validate_size
+
+_DATA_URI_RE = re.compile(r"^data:image/([a-zA-Z+]+);base64,(.+)$", re.DOTALL)
 
 
 def _extract_image_urls(data: Dict[str, Any]) -> List[str]:
@@ -51,7 +54,10 @@ async def generate_image(
             英文效果更好，中文自动翻译。
             例如: "A luminous floating city above a misty canyon at sunrise, cinematic realism"
         size: 尺寸 WIDTHxHEIGHT。默认 "1024x768"。
-        input_image_url: 输入图片 URL，用于图生图。默认 None。
+        input_image_url: 输入图片，支持 HTTP(S) URL 或 Data URI (base64)。
+            用于图生图。默认 None（文生图）。
+            例如: "https://example.com/img.png"
+            或: "data:image/png;base64,iVBORw0KGgo..."
         translate_prompt: 是否自动翻译非英文提示词。默认 True。
 
     Returns:

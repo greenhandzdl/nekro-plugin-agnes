@@ -222,7 +222,7 @@ async def create_video(
 
         task = await create_video_task(
             task_id=task_id, prompt=prepared_prompt, ctx=_ctx,
-            translated_prompt=translated, model=config.VIDEO_MODEL,
+            translated=translated, model=config.VIDEO_MODEL,
             height=height, width=width, num_frames=num_frames, frame_rate=frame_rate,
             nis=num_inference_steps, seed=seed,
             negative_prompt=negative_prompt, image_url=image_url,

@@ -7,7 +7,7 @@
 """
 
 import time
-from typing import List
+from typing import List, Optional
 
 from nekro_agent.adapters.onebot_v11.matchers.command import command_guard, finish_with
 from nekro_agent.api.core import logger
@@ -426,6 +426,37 @@ async def handle_info(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Mess
         await finish_with(matcher, message=f"任务 {task_id} 不存在")
 
     await finish_with(matcher, message=f"任务详情:\n\n{format_task_info(task)}")
+
+
+@on_command("agnes_help", aliases={"agnes-h", "agnes_h"}, priority=5, block=True).handle()
+async def handle_help(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Message = CommandArg()):
+    """显示插件使用帮助"""
+    username, cmd_content, chat_key, chat_type = await command_guard(event, bot, arg, matcher)
+
+    approval_status = "开启" if config.REQUIRE_ADMIN_APPROVAL else "关闭"
+    help_text = (
+        f"🎬 Agnes AI 视频生成插件 v1.1.0\n\n"
+        f"📋 管理员命令:\n"
+        f"  /agnes_y [task_id] — 批准视频任务\n"
+        f"  /agnes_n [task_id] — 拒绝视频任务\n"
+        f"  /agnes_list [page] — 分页任务列表\n"
+        f"  /agnes_info <task_id> — 任务详情\n"
+        f"  /agnes_help — 显示此帮助\n\n"
+        f"⚙️ 配置:\n"
+        f"  审批流程: {approval_status}\n"
+        f"  视频模型: {config.VIDEO_MODEL}\n"
+        f"  轮询间隔: {config.POLL_INTERVAL}s\n"
+        f"  最大轮询: {config.MAX_POLL_ATTEMPTS}次\n\n"
+        f"💡 Agent 调用:\n"
+        f"  create_video(prompt, ...) — 创建视频\n"
+        f"  get_video_by_task_id(task_id) — 获取视频 URL\n"
+        f"  cancel_current_video_task() — 取消任务\n"
+        f"  approve_video_task(task_id) — 批准任务\n"
+        f"  reject_video_task(task_id) — 拒绝任务\n"
+        f"  list_video_tasks(page) — 任务列表\n"
+        f"  get_video_task_info(task_id) — 任务详情"
+    )
+    await finish_with(matcher, message=help_text)
 
 
 # ---------------------------------------------------------------------------

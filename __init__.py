@@ -9,4 +9,10 @@ from .handlers_text import *  # noqa: F403
 from .handlers_image import *  # noqa: F403
 from .handlers_video import *  # noqa: F403
 
-__all__ = ["plugin"]
+__all__ = [
+    "plugin",
+    "generate_text",
+    "generate_image",
+    "create_video",
+    "get_video",
+]

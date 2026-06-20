@@ -150,11 +150,7 @@ async def get_video(
             )
 
         urls = extract_video_urls(data)
-        status_str = str(data.get("status", "")).lower()
-        try:
-            status_val = TaskStatus(status_str).value
-        except ValueError:
-            status_val = status_str
+        status_val = TaskStatus.from_api(data.get("status", "")).value
 
         result: Dict[str, Any] = {
             "type": "video-result", "task_id": task_id,

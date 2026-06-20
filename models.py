@@ -17,6 +17,14 @@ class TaskStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
+    @classmethod
+    def from_api(cls, status: str) -> "TaskStatus":
+        """从 API 返回的状态字符串转换，未知状态映射为 QUEUED。"""
+        try:
+            return cls(status.lower())
+        except ValueError:
+            return cls.QUEUED
+
 
 class VideoTask(BaseModel):
     """视频生成任务"""

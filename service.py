@@ -211,10 +211,7 @@ async def create_video_task(
     if api_id:
         task.task_id = api_id
     if api_st:
-        try:
-            task.status = TaskStatus(api_st)
-        except ValueError:
-            pass
+        task.status = TaskStatus.from_api(api_st)
 
     sd.add_task(task)
     await _save(sd)
@@ -249,10 +246,7 @@ async def _poll(tid: str) -> None:
                 await _fail(tid, task.chat_key, json.dumps(data["error"], ensure_ascii=False))
                 return
 
-            try:
-                st = TaskStatus(str(data.get("status", "")).lower())
-            except ValueError:
-                st = None
+            st = TaskStatus.from_api(data.get("status", ""))
 
             if st == TaskStatus.COMPLETED:
                 urls = extract_video_urls(data)

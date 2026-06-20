@@ -15,7 +15,6 @@ from .conf import config, plugin
 from .models import TaskStatus
 from .service import (
     create_video_task,
-    extract_image_urls,
     extract_video_urls,
     get_video_task,
     prepare_generation_prompt,
@@ -24,15 +23,18 @@ from .service import (
 )
 
 
-async def request_json(client, method, path, payload=None):
-    """兼容 handlers 内部的 request_json 调用。"""
+async def _request_json(
+    client: httpx.AsyncClient, method: str, path: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """发送 JSON 请求并返回解析后的响应。"""
     from .service import _req
     return await _req(client, method, path, payload)
 
 
 def _headers() -> dict[str, str]:
-    from .service import _resolve_api_key
-    return {"Authorization": f"Bearer {_resolve_api_key()}", "Content-Type": "application/json"}
+    from .service import _key
+    return {"Authorization": f"Bearer {_key()}", "Content-Type": "application/json"}
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +43,7 @@ def _headers() -> dict[str, str]:
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
+    SandboxMethodType.TOOL,
     name="generate_text",
     description="使用 Agnes AI 生成文本。支持普通模式和流式模式。",
 )
@@ -70,7 +72,7 @@ async def generate_text(
         async with httpx.AsyncClient() as client:
             if stream:
                 return await _handle_stream(client, payload)
-            data = await request_json(client, "POST", "/v1/chat/completions", payload)
+            data = await _request_json(client, "POST", "/v1/chat/completions", payload)
         content = data["choices"][0]["message"].get("content") if data.get("choices") else None
         if content:
             return content
@@ -121,7 +123,7 @@ async def _handle_stream(client: httpx.AsyncClient, payload: Dict[str, Any]) -> 
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
+    SandboxMethodType.TOOL,
     name="generate_image",
     description="使用 Agnes AI 生成或编辑图片。支持文生图和图生图。",
 )
@@ -132,7 +134,7 @@ async def generate_image(
     input_image_url: Optional[str] = None,
     translate_prompt: bool = True,
 ) -> str:
-    """使用 Agnes AI 生成或编辑图片。"""
+    """使用 Agnes AI 生成或编辑图片，返回图片 URL。"""
     try:
         validate_size(size)
     except ValueError as e:
@@ -140,7 +142,7 @@ async def generate_image(
 
     try:
         async with httpx.AsyncClient() as client:
-            prepared_prompt, translated = await prepare_generation_prompt(client, prompt, translate_prompt)
+            prepared_prompt, _ = await prepare_generation_prompt(client, prompt, translate_prompt)
 
             payload: Dict[str, Any] = {"model": config.IMAGE_MODEL, "prompt": prepared_prompt}
             if size:
@@ -151,17 +153,34 @@ async def generate_image(
                 extra["image"] = input_image_url
             payload["extra_body"] = extra
 
-            data = await request_json(client, "POST", "/v1/images/generations", payload)
+            data = await _request_json(client, "POST", "/v1/images/generations", payload)
 
-        urls = extract_image_urls(data)
-        mode = "image-to-image" if input_image_url else "text-to-image"
-        return json.dumps({
-            "type": mode, "urls": urls,
-            "prompt_used": prepared_prompt, "translated_prompt": translated,
-        }, ensure_ascii=False, indent=2)
+        # 直接返回图片 URL
+        urls = _extract_image_urls(data)
+        if urls:
+            return urls[0]
+
+        # 如果没有 URL，返回完整响应 JSON
+        return json.dumps(data, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.exception(f"图片生成失败: {e}")
         return f"图片生成失败: {e}"
+
+
+def _extract_image_urls(data: Dict[str, Any]) -> List[str]:
+    """从图片生成响应中提取 URL 列表。"""
+    urls: List[str] = []
+    if isinstance(data.get("url"), str):
+        urls.append(data["url"])
+    if isinstance(data.get("image_url"), str):
+        urls.append(data["image_url"])
+    if isinstance(data.get("data"), list):
+        for item in data["data"]:
+            if isinstance(item, dict):
+                for key in ("url", "image_url"):
+                    if isinstance(item.get(key), str):
+                        urls.append(item[key])
+    return urls
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +189,7 @@ async def generate_image(
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
+    SandboxMethodType.TOOL,
     name="create_video",
     description="使用 Agnes AI 创建视频任务。支持文生视频、图生视频、多图视频和关键帧动画。任务在后台异步处理，完成后自动通知。",
 )
@@ -205,7 +224,7 @@ async def create_video(
             task_id=task_id, prompt=prepared_prompt, ctx=_ctx,
             translated_prompt=translated, model=config.VIDEO_MODEL,
             height=height, width=width, num_frames=num_frames, frame_rate=frame_rate,
-            num_inference_steps=num_inference_steps, seed=seed,
+            nis=num_inference_steps, seed=seed,
             negative_prompt=negative_prompt, image_url=image_url,
             image_urls=image_urls, mode=mode,
         )
@@ -227,7 +246,7 @@ async def create_video(
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
+    SandboxMethodType.TOOL,
     name="get_video",
     description="查询 Agnes AI 视频任务的状态和结果。优先从本地缓存获取，force_refresh=true 时从 API 获取最新状态。",
 )
@@ -246,7 +265,7 @@ async def get_video(
 
         # 从 API 获取最新状态
         async with httpx.AsyncClient() as client:
-            data = await request_json(client, "GET", f"/v1/videos/{task_id}")
+            data = await _request_json(client, "GET", f"/v1/videos/{task_id}")
 
         if data.get("error"):
             return json.dumps(

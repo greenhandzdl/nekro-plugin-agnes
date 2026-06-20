@@ -5,6 +5,8 @@
 """
 
 from .conf import plugin
-from .handlers import *  # noqa: F403
+from .handlers_text import *  # noqa: F403
+from .handlers_image import *  # noqa: F403
+from .handlers_video import *  # noqa: F403
 
 __all__ = ["plugin"]

@@ -1,101 +1,82 @@
-# NekroAgent 插件模板
+# Agnes AI Generation Plugin
 
-> 一个帮助开发者快速创建 NekroAgent 插件的模板仓库。
+> 一个用于 NekroAgent 的 Agnes AI 生成插件，提供文本、图片和视频生成功能。
 
-## 🚀 快速开始
+## 功能
 
-### 1. 使用模板创建仓库
+- **文本生成**：使用 `agnes-2.0-flash` 模型生成文本，支持流式输出
+- **文生图**：使用 `agnes-image-2.1-flash` 生成图片
+- **图生图 / 图片编辑**：基于输入图片进行修改
+- **文生视频**：使用 `agnes-video-v2.0` 创建视频
+- **图生视频**：将静态图片动态化
+- **多图视频 / 关键帧动画**：多张图片生成过渡动画
+- **自动翻译**：非英文提示词自动翻译为英文，提高生成质量
 
-1. 点击本仓库页面上的 "Use this template" 按钮
-2. 输入你的插件仓库名称，推荐命名格式：`nekro-plugin-[你的插件包名]`
-3. 选择公开或私有仓库
-4. 点击 "Create repository from template" 创建你的插件仓库
+## 安装
 
-### 2. 克隆你的插件仓库
-
-```bash
-git clone https://github.com/你的用户名/你的插件仓库名.git
-cd 你的插件仓库名
-```
-
-### 3. 安装依赖
+### 1. 安装插件包
 
 ```bash
-# 安装 uv 包管理工具
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 根据指引安装 uv 后打开新的终端检查 uv 是否安装成功
-uv --version
-
-# 同步安装所有依赖（自动创建虚拟环境）
-uv sync
+cd nekro-plugin-agnes
+pip install -e .
 ```
 
-## 📝 插件开发指南
+或直接从 GitHub 安装：
 
-### 插件结构
-
-一个标准的 NekroAgent 插件需要在 `__init__.py` 中提供一个 `plugin` 实例，这是插件的核心，用于注册插件功能和配置。
-
-```python
-# 示例插件结构
-plugin = NekroPlugin(
-    name="你的插件名称",  # 插件显示名称
-    module_name="plugin_module_name",  # 插件模块名 (在NekroAI社区需唯一)
-    description="插件描述",  # 插件功能简介
-    version="1.0.0",  # 插件版本
-    author="你的名字",  # 作者信息
-    url="https://github.com/你的用户名/你的插件仓库名",  # 插件仓库链接
-)
+```bash
+pip install git+https://github.com/Yacey/agnes-ai-generation-skill.git
 ```
 
-### 开发功能
+### 2. 配置 API Key
 
-1. **配置插件参数**：使用 `@plugin.mount_config()` 装饰器创建可配置参数
+在 NekroAgent 插件配置中设置 `API_KEY`，或设置环境变量：
 
-```python
-@plugin.mount_config()
-class MyPluginConfig(ConfigBase):
-    """插件配置说明"""
-
-    API_KEY: str = Field(
-        default="",
-        title="API密钥",
-        description="第三方服务的API密钥",
-    )
+```bash
+export AGNES_API_KEY="your_api_key"
 ```
 
-2. **添加沙盒方法**：使用 `@plugin.mount_sandbox_method()` 添加 AI 可调用的函数
+也支持以下环境变量名：`AGNES_API_TOKEN`、`APIHUB_AGNES_API_KEY`
 
-```python
-@plugin.mount_sandbox_method(SandboxMethodType.AGENT, name="函数名称", description="函数功能描述")
-async def my_function(_ctx: AgentCtx, param1: str) -> str:
-    """实现插件功能的具体逻辑"""
-    return f"处理结果: {param1}"
+### 3. 注册到 NekroAgent
+
+确保插件被 NekroAgent 发现并加载。参考 NekroAgent 插件配置文档。
+
+## 使用
+
+安装并配置后，Agent 会自动在以下场景调用本插件：
+
+- 要求生成文本内容时
+- 要求生成图片时（"画一张..."、"生成图片..."）
+- 要求生成视频时（"制作视频..."、"把图片动起来..."）
+- 要求编辑图片时（"修改这张图..."、"把图片变成..."）
+
+### 工具列表
+
+| 工具名 | 功能 | 关键参数 |
+|--------|------|----------|
+| `generate_text` | 文本生成 | `prompt`, `system`, `temperature`, `max_tokens`, `stream` |
+| `generate_image` | 文生图 / 图生图 | `prompt`, `size`, `input_image_url`, `translate_prompt` |
+| `create_video` | 创建视频任务 | `prompt`, `image_url`, `image_urls`, `mode`, `num_frames`, `poll` |
+| `get_video` | 查询视频状态 | `task_id` |
+
+### 示例
+
+让 Agent 生成一张图片：
+
+```
+使用 Agnes 帮我生成一张高信息密度的未来城市图片。
 ```
 
-3. **资源清理**：使用 `@plugin.mount_cleanup_method()` 添加资源清理函数
+让 Agent 生成视频：
 
-```python
-@plugin.mount_cleanup_method()
-async def clean_up():
-    """清理资源，如数据库连接等"""
-    logger.info("资源已清理")
+```
+使用 Agnes 把这张图片生成一段电影感视频。
 ```
 
-## 📦 插件发布
+## API 参考
 
-完成开发后，你可以：
+详细 API 信息请参考原始 skill 文档中的 `references/api.md`。
 
-1. 提交到 GitHub 仓库
-2. 发布到 NekroAI 云社区共享给所有用户
+## 许可证
 
-## 🔍 更多资源
-
-- [NekroAgent 官方文档](https://doc.nekro.ai/)
-- [插件开发详细指南](https://doc.nekro.ai/docs/04_plugin_dev/intro.html)
-- [社区交流群](https://qm.qq.com/q/hJlRwD17Ae)：636925153
-
-## 📄 许可证
-
-MIT
+MIT License. See [LICENSE](LICENSE).

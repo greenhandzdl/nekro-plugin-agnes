@@ -266,12 +266,15 @@ async def create_video_task(
 # ---------------------------------------------------------------------------
 
 
+_APPROVABLE_STATUSES = {TaskStatus.QUEUED, TaskStatus.PENDING}
+
+
 async def approve_video_task(task_id: str) -> bool:
-    """批准视频任务"""
+    """批准视频任务（接受 QUEUED 和 PENDING 状态）"""
     gt = await _load_tasks()
     task = gt.get_task(task_id)
-    if not task or task.status != TaskStatus.PENDING:
-        logger.warning(f"批准失败: {task_id} 不存在或状态非 PENDING")
+    if not task or task.status not in _APPROVABLE_STATUSES:
+        logger.warning(f"批准失败: {task_id} 不存在或状态不可审批: {task.status if task else 'N/A'}")
         return False
     await update_task_status(task_id, TaskStatus.APPROVED)
     asyncio.create_task(process_video_task(task_id))
@@ -279,11 +282,11 @@ async def approve_video_task(task_id: str) -> bool:
 
 
 async def reject_video_task(task_id: str) -> bool:
-    """拒绝视频任务"""
+    """拒绝视频任务（接受 QUEUED 和 PENDING 状态）"""
     gt = await _load_tasks()
     task = gt.get_task(task_id)
-    if not task or task.status != TaskStatus.PENDING:
-        logger.warning(f"拒绝失败: {task_id} 不存在或状态非 PENDING")
+    if not task or task.status not in _APPROVABLE_STATUSES:
+        logger.warning(f"拒绝失败: {task_id} 不存在或状态不可审批: {task.status if task else 'N/A'}")
         return False
     await update_task_status(task_id, TaskStatus.REJECTED, error_message="管理员拒绝了请求")
     return True

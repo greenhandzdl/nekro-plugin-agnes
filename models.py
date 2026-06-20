@@ -12,13 +12,14 @@ from .conf import config
 class TaskStatus(str, Enum):
     """视频任务状态"""
 
-    PENDING = "pending"
-    APPROVED = "approved"
-    REJECTED = "rejected"
-    PROCESSING = "processing"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELED = "canceled"
+    QUEUED = "queued"       # API 返回的初始状态
+    PENDING = "pending"     # 等待管理员审批
+    APPROVED = "approved"   # 已批准，准备执行
+    REJECTED = "rejected"   # 已拒绝
+    PROCESSING = "processing"  # 执行中
+    COMPLETED = "completed"  # 已完成
+    FAILED = "failed"       # 失败
+    CANCELED = "canceled"   # 已取消
 
     @classmethod
     def from_api(cls, status: str) -> "TaskStatus":

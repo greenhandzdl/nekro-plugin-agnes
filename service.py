@@ -1,9 +1,17 @@
-"""业务逻辑：任务管理、API 调用、异步视频处理"""
+"""业务逻辑：任务管理、API 调用、异步视频处理
+
+对齐 tongyi_wanx 架构:
+- 会话级任务追踪 (ChatSessionData + current_task_id)
+- 全局任务存储 (GlobalTaskData)
+- 审批流程 (PENDING → APPROVED → PROCESSING → COMPLETED/FAILED)
+- 后台轮询 + 完成通知
+"""
 
 import asyncio
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -13,11 +21,12 @@ from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.services.message_service import message_service
 
 from .conf import config, store
-from .models import TaskStatus, TaskStoreData, VideoTask
+from .models import ChatSessionData, GlobalTaskData, TaskStatus, VideoTask
 
 SIZE_RE = re.compile(r"^[1-9]\d*x[1-9]\d*$")
 _ENV_NAMES = ("AGNES_API_KEY", "AGNES_API_TOKEN", "APIHUB_AGNES_API_KEY")
-_STORE = "agnes_video_tasks"
+_STORE_TASKS = "agnes_video_tasks"
+_STORE_CHAT = "agnes_chat"
 _TR_SYS = (
     "Translate the user's image/video generation prompt into fluent English. "
     "Preserve all concrete visual details, style words, camera motion, lighting, "
@@ -29,13 +38,22 @@ _TR_SYS = (
 # ---------------------------------------------------------------------------
 
 
-async def _load() -> TaskStoreData:
-    data = await store.get(chat_key="global", store_key=_STORE)
-    return TaskStoreData.model_validate_json(data) if data else TaskStoreData()
+async def _load_tasks() -> GlobalTaskData:
+    data = await store.get(chat_key="global", store_key=_STORE_TASKS)
+    return GlobalTaskData.model_validate_json(data) if data else GlobalTaskData()
 
 
-async def _save(s: TaskStoreData) -> None:
-    await store.set(chat_key="global", store_key=_STORE, value=s.model_dump_json())
+async def _save_tasks(s: GlobalTaskData) -> None:
+    await store.set(chat_key="global", store_key=_STORE_TASKS, value=s.model_dump_json())
+
+
+async def _load_chat(chat_key: str) -> ChatSessionData:
+    data = await store.get(chat_key=chat_key, store_key=_STORE_CHAT)
+    return ChatSessionData.model_validate_json(data) if data else ChatSessionData()
+
+
+async def _save_chat(chat_key: str, data: ChatSessionData) -> None:
+    await store.set(chat_key=chat_key, store_key=_STORE_CHAT, value=data.model_dump_json())
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +68,7 @@ def _key() -> str:
         v = os.environ.get(n)
         if v:
             return v
-    raise RuntimeError("未找到 API Key。请设置插件配置 API_KEY 或环境变量 AGNES_API_KEY/AGNES_API_TOKEN/APIHUB_AGNES_API_KEY。")
+    raise RuntimeError("未找到 API Key。请设置 API_KEY 或环境变量 AGNES_API_KEY/AGNES_API_TOKEN/APIHUB_AGNES_API_KEY。")
 
 
 def _hdrs() -> dict[str, str]:
@@ -60,10 +78,8 @@ def _hdrs() -> dict[str, str]:
 async def _req(client: httpx.AsyncClient, method: str, path: str, payload: Optional[Dict] = None) -> Dict[str, Any]:
     url = f"{config.BASE_URL}{path}"
     try:
-        if method == "GET":
-            r = await client.get(url, headers=_hdrs(), timeout=config.TIMEOUT)
-        else:
-            r = await client.post(url, json=payload, headers=_hdrs(), timeout=config.TIMEOUT)
+        r = await (client.get(url, headers=_hdrs(), timeout=config.TIMEOUT) if method == "GET"
+                   else client.post(url, json=payload, headers=_hdrs(), timeout=config.TIMEOUT))
         r.raise_for_status()
         return json.loads(r.text) if r.text else {}
     except httpx.HTTPStatusError as e:
@@ -155,7 +171,7 @@ def validate_video_args(nf: Optional[int], fr: Optional[float], h: Optional[int]
 
 
 # ---------------------------------------------------------------------------
-# 视频任务
+# 视频任务 — 创建
 # ---------------------------------------------------------------------------
 
 
@@ -185,13 +201,14 @@ def _build_payload(
 
 
 async def create_video_task(
-    task_id: str, prompt: str, ctx: AgentCtx, translated: Optional[str], model: str,
+    task_id: str, prompt: str, ctx: AgentCtx,
+    reason: Optional[str] = None, model: str = "",
     height: int = 768, width: int = 1152, num_frames: int = 121, frame_rate: float = 24,
     nis: Optional[int] = None, seed: Optional[int] = None, neg: Optional[str] = None,
     img: Optional[str] = None, imgs: Optional[List[str]] = None, mode: Optional[str] = None,
 ) -> VideoTask:
-    """创建视频任务并提交到 Agnes API，后台轮询结果。"""
-    sd = await _load()
+    """创建视频任务并提交到 Agnes API。"""
+    gt = await _load_tasks()
     if not ctx.from_chat_key:
         raise ValueError("from_chat_key is required")
 
@@ -205,33 +222,127 @@ async def create_video_task(
 
     task = VideoTask.create(
         task_id=task_id, chat_key=ctx.from_chat_key, prompt=prompt,
-        translated_prompt=translated, model=model, height=height, width=width,
+        reason=reason, model=model, height=height, width=width,
         num_frames=num_frames, frame_rate=frame_rate, image_url=img, image_urls=imgs, mode=mode,
     )
-    # 使用 API 返回的 id（可能与本地 task_id 不同）
     if api_id:
         task.task_id = api_id
     if api_st:
         task.status = TaskStatus.from_api(api_st)
 
-    sd.add_task(task)
-    await _save(sd)
+    gt.add_task(task)
+    await _save_tasks(gt)
 
-    # 启动后台轮询，使用 API 返回的 task_id
-    asyncio.create_task(_process_video_task(task.task_id))
+    chat_data = await _load_chat(ctx.from_chat_key)
+    chat_data.current_task_id = task.task_id
+    await _save_chat(ctx.from_chat_key, chat_data)
+
+    if config.REQUIRE_ADMIN_APPROVAL:
+        manager_msg = (
+            f"【视频生成申请】\n任务ID: {task.task_id}\n会话: {ctx.from_chat_key}\n"
+            f"提示词: {prompt}\n模型: {model}\n尺寸: {width}x{height}\n"
+            f"帧数: {num_frames}\n帧率: {frame_rate}\n"
+        )
+        if reason:
+            manager_msg += f"原因: {reason}\n"
+        manager_msg += (
+            f"使用 approve_video_task(task_id=\"{task.task_id}\") 批准\n"
+            f"使用 reject_video_task(task_id=\"{task.task_id}\") 拒绝"
+        )
+        try:
+            target = config.MANAGER_CHAT_KEY or ctx.from_chat_key
+            await message.send_text(chat_key=target, message=manager_msg, ctx=ctx, record=False)
+        except Exception as e:
+            logger.error(f"发送审批消息失败: {e}")
+    else:
+        await update_task_status(task.task_id, TaskStatus.APPROVED)
+        asyncio.create_task(process_video_task(task.task_id))
 
     return task
 
 
 # ---------------------------------------------------------------------------
-# 后台轮询（参考 tongyi_wanx 架构）
+# 视频任务 — 审批
 # ---------------------------------------------------------------------------
 
 
-async def _process_video_task(task_id: str) -> None:
-    """后台轮询视频任务状态，完成后通知用户。"""
-    sd = await _load()
-    task = sd.get_task(task_id)
+async def approve_video_task(task_id: str) -> bool:
+    """批准视频任务"""
+    gt = await _load_tasks()
+    task = gt.get_task(task_id)
+    if not task or task.status != TaskStatus.PENDING:
+        logger.warning(f"批准失败: {task_id} 不存在或状态非 PENDING")
+        return False
+    await update_task_status(task_id, TaskStatus.APPROVED)
+    asyncio.create_task(process_video_task(task_id))
+    return True
+
+
+async def reject_video_task(task_id: str) -> bool:
+    """拒绝视频任务"""
+    gt = await _load_tasks()
+    task = gt.get_task(task_id)
+    if not task or task.status != TaskStatus.PENDING:
+        logger.warning(f"拒绝失败: {task_id} 不存在或状态非 PENDING")
+        return False
+    await update_task_status(task_id, TaskStatus.REJECTED, error_message="管理员拒绝了请求")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 视频任务 — 状态更新 + 通知
+# ---------------------------------------------------------------------------
+
+
+async def update_task_status(task_id: str, status: TaskStatus, **kwargs) -> None:
+    """更新任务状态，完成后清理会话并通知"""
+    gt = await _load_tasks()
+    if not gt.update_task(task_id, status=status, **kwargs):
+        return
+    await _save_tasks(gt)
+
+    task = gt.get_task(task_id)
+    if not task:
+        return
+
+    if status == TaskStatus.COMPLETED and task.video_urls:
+        chat_data = await _load_chat(task.chat_key)
+        chat_data.add_history(task.prompt, task.video_urls, task.task_id)
+        chat_data.current_task_id = None
+        await _save_chat(task.chat_key, chat_data)
+
+        msg = (
+            f"【视频生成完成】\n任务ID: {task_id}\n提示词: {task.prompt}\n"
+            f"视频已生成完毕!\n视频URL:\n" + "\n".join(task.video_urls) +
+            "\n(use `send_msg_file` to send the video)"
+        )
+        try:
+            await message_service.push_system_message(chat_key=task.chat_key, agent_messages=msg, trigger_agent=True)
+        except Exception as e:
+            logger.error(f"发送完成通知失败: {e}")
+
+    elif status == TaskStatus.FAILED:
+        chat_data = await _load_chat(task.chat_key)
+        chat_data.current_task_id = None
+        await _save_chat(task.chat_key, chat_data)
+
+        err = task.error_message or "未知错误"
+        msg = f"【视频生成失败】\n任务ID: {task_id}\n提示词: {task.prompt}\n错误信息: {err}"
+        try:
+            await message_service.push_system_message(chat_key=task.chat_key, agent_messages=msg, trigger_agent=True)
+        except Exception as e:
+            logger.error(f"发送失败通知失败: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 视频任务 — 后台轮询
+# ---------------------------------------------------------------------------
+
+
+async def process_video_task(task_id: str) -> None:
+    """后台轮询视频任务状态"""
+    gt = await _load_tasks()
+    task = gt.get_task(task_id)
     if not task:
         return
 
@@ -247,48 +358,23 @@ async def _process_video_task(task_id: str) -> None:
                 continue
 
             if data.get("error"):
-                await _fail(task_id, task.chat_key, json.dumps(data["error"], ensure_ascii=False))
+                await update_task_status(task_id, TaskStatus.FAILED, error_message=json.dumps(data["error"], ensure_ascii=False))
                 return
 
             st = TaskStatus.from_api(data.get("status", ""))
 
             if st == TaskStatus.COMPLETED:
                 urls = extract_video_urls(data)
-                await _upd(task_id, TaskStatus.COMPLETED, video_urls=urls)
-                await _notify(task_id, task.chat_key, urls=urls)
+                await update_task_status(task_id, TaskStatus.COMPLETED, video_urls=urls)
                 return
             if st == TaskStatus.FAILED:
                 err = data.get("error_message") or data.get("message") or "未知错误"
-                await _fail(task_id, task.chat_key, str(err))
+                await update_task_status(task_id, TaskStatus.FAILED, error_message=str(err))
                 return
 
             logger.info(f"{task_id}: status={data.get('status')} progress={data.get('progress')} ({i + 1}/{config.MAX_POLL_ATTEMPTS})")
 
-    await _fail(task_id, task.chat_key, "任务超时")
-
-
-async def _upd(tid: str, status: TaskStatus, **kw) -> None:
-    s = await _load()
-    s.update_task(tid, status=status, **kw)
-    await _save(s)
-
-
-async def _fail(tid: str, chat_key: str, err: str) -> None:
-    await _upd(tid, TaskStatus.FAILED, error_message=err)
-    await _notify(tid, chat_key, error=err)
-
-
-async def _notify(tid: str, chat_key: str, urls: Optional[List[str]] = None, error: Optional[str] = None) -> None:
-    if urls:
-        msg = f"【视频生成完成】\n任务ID: {tid}\n视频已生成完毕!\n视频URL:\n" + "\n".join(urls) + "\n(use `send_msg_file` to send the video)"
-    elif error:
-        msg = f"【视频生成失败】\n任务ID: {tid}\n错误信息: {error}"
-    else:
-        return
-    try:
-        await message_service.push_system_message(chat_key=chat_key, agent_messages=msg, trigger_agent=True)
-    except Exception as e:
-        logger.error(f"通知发送失败: {e}")
+    await update_task_status(task_id, TaskStatus.FAILED, error_message="任务超时")
 
 
 # ---------------------------------------------------------------------------
@@ -296,15 +382,60 @@ async def _notify(tid: str, chat_key: str, urls: Optional[List[str]] = None, err
 # ---------------------------------------------------------------------------
 
 
-async def get_video_task(tid: str) -> Optional[VideoTask]:
-    s = await _load()
-    return s.get_task(tid)
+async def get_video_task(task_id: str) -> Optional[VideoTask]:
+    gt = await _load_tasks()
+    return gt.get_task(task_id)
 
 
-async def has_processing_task(chat_key: str) -> Optional[VideoTask]:
-    """检查指定会话是否有正在进行的视频任务。"""
-    sd = await _load()
-    for task in sd.tasks.values():
-        if task.chat_key == chat_key and task.status in (TaskStatus.QUEUED, TaskStatus.IN_PROGRESS):
-            return task
-    return None
+async def cancel_current_video_task(chat_key: str) -> Optional[VideoTask]:
+    """取消当前会话的视频任务"""
+    chat_data = await _load_chat(chat_key)
+    if not chat_data.current_task_id:
+        return None
+
+    gt = await _load_tasks()
+    task = gt.get_task(chat_data.current_task_id)
+    if not task:
+        chat_data.current_task_id = None
+        await _save_chat(chat_key, chat_data)
+        return None
+
+    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELED, TaskStatus.REJECTED):
+        chat_data.current_task_id = None
+        await _save_chat(chat_key, chat_data)
+        return None
+
+    task.status = TaskStatus.CANCELED
+    chat_data.current_task_id = None
+    await _save_chat(chat_key, chat_data)
+    await _save_tasks(gt)
+    return task
+
+
+def format_task_info(task: VideoTask) -> str:
+    """格式化任务信息"""
+    create_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task.create_time))
+    update_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task.update_time))
+
+    info = (
+        f"任务ID: {task.task_id}\n会话: {task.chat_key}\n提示词: {task.prompt}\n"
+        f"状态: {task.status.value}\n模型: {task.model}\n"
+        f"尺寸: {task.width}x{task.height}\n帧数: {task.num_frames}\n帧率: {task.frame_rate}\n"
+        f"创建时间: {create_time}\n更新时间: {update_time}\n"
+    )
+    if task.reason:
+        info += f"原因: {task.reason}\n"
+    if task.video_urls:
+        info += f"视频URL: {', '.join(task.video_urls)}\n"
+    if task.error_message:
+        info += f"错误信息: {task.error_message}\n"
+    return info
+
+
+async def get_tasks_page(page: int) -> Tuple[List[VideoTask], int, int]:
+    gt = await _load_tasks()
+    return (
+        gt.get_tasks_page(page, config.ITEMS_PER_PAGE),
+        gt.get_total_pages(config.ITEMS_PER_PAGE),
+        len(gt.get_all_tasks()),
+    )

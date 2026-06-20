@@ -27,17 +27,14 @@ plugin = NekroPlugin(
     module_name="agnes_ai_generation",
     description="通过 Agnes AI API 进行文本、图片和视频生成",
     version="1.0.0",
-    author="Yacey",
-    url="https://github.com/Yacey/agnes-ai-generation-skill",
+    author="greenhandzdl",
+    url="https://github.com/greenhandzdl/nekro-plugin-agnes",
 )
 
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
 
-TEXT_MODEL = "agnes-2.0-flash"
-IMAGE_MODEL = "agnes-image-2.1-flash"
-VIDEO_MODEL = "agnes-video-v2.0"
 SIZE_RE = re.compile(r"^[1-9]\d*x[1-9]\d*$")
 
 
@@ -59,6 +56,21 @@ class AgnesConfig(ConfigBase):
         default=120,
         title="请求超时时间",
         description="API 请求的超时时间（秒）",
+    )
+    config.TEXT_MODEL: str = Field(
+        default="agnes-2.0-flash",
+        title="文本模型",
+        description="文本生成使用的模型名称",
+    )
+    config.IMAGE_MODEL: str = Field(
+        default="agnes-image-2.1-flash",
+        title="图片模型",
+        description="图片生成/编辑使用的模型名称",
+    )
+    config.VIDEO_MODEL: str = Field(
+        default="agnes-video-v2.0",
+        title="视频模型",
+        description="视频生成使用的模型名称",
     )
 
 
@@ -204,7 +216,7 @@ def _needs_english_translation(prompt: str) -> bool:
 async def _translate_prompt_to_english(client: httpx.AsyncClient, prompt: str) -> str:
     """调用 Agnes 文本模型将非英文提示词翻译为英文。"""
     payload = {
-        "model": TEXT_MODEL,
+        "model": config.TEXT_MODEL,
         "messages": [
             {
                 "role": "system",
@@ -361,7 +373,7 @@ async def generate_text(
     messages.append({"role": "user", "content": prompt})
 
     payload: Dict[str, Any] = {
-        "model": TEXT_MODEL,
+        "model": config.TEXT_MODEL,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -432,7 +444,7 @@ async def generate_image(
             )
 
             payload: Dict[str, Any] = {
-                "model": IMAGE_MODEL,
+                "model": config.IMAGE_MODEL,
                 "prompt": prepared_prompt,
             }
             if size:
@@ -533,7 +545,7 @@ async def create_video(
             )
 
             payload: Dict[str, Any] = {
-                "model": VIDEO_MODEL,
+                "model": config.VIDEO_MODEL,
                 "prompt": prepared_prompt,
                 "height": height,
                 "width": width,

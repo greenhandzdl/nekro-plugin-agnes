@@ -241,56 +241,8 @@ async def create_video_task(
     chat_data.current_task_id = task.task_id
     await _save_chat(ctx.from_chat_key, chat_data)
 
-    # 调用 API 创建任务，失败时标记 FAILED 并通知
-    try:
-        async with httpx.AsyncClient() as client:
-            created = await _req(client, "POST", "/v1/videos", payload)
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"创建视频任务 API 调用失败: {error_msg}")
-        await update_task_status(task.task_id, TaskStatus.FAILED, error_message=error_msg)
-        # 清理会话
-        chat_data = await _load_chat(ctx.from_chat_key)
-        if chat_data.current_task_id == task.task_id:
-            chat_data.current_task_id = None
-            await _save_chat(ctx.from_chat_key, chat_data)
-        raise
-
-    api_id = created.get("id")
-    api_video_id = created.get("video_id") or created.get("videoId")
-    api_st = str(created.get("status", "")) if created.get("status") is not None else None
-
-    logger.info(f"创建任务响应: id={api_id}, video_id={api_video_id}, status={api_st}")
-
-    # 用 API 返回的 id 更新 task_id（可能和本地生成的不同）
-    if api_id and api_id != task.task_id:
-        # 需要更新 store 中的 key
-        gt = await _load_tasks()
-        gt.tasks.pop(task.task_id, None)
-        task.task_id = api_id
-        gt.add_task(task)
-        await _save_tasks(gt)
-        # 更新会话中的 task_id
-        chat_data = await _load_chat(ctx.from_chat_key)
-        if chat_data.current_task_id == task_id:
-            chat_data.current_task_id = api_id
-            await _save_chat(ctx.from_chat_key, chat_data)
-
-    if api_video_id:
-        task.video_id = api_video_id
-
-    # 只有不需审批时，才用 API 返回的状态覆盖初始状态
-    # 需审批时保持 PENDING，等待管理员审批
-    if api_st and not config.REQUIRE_ADMIN_APPROVAL:
-        task.status = TaskStatus.from_api(api_st)
-
-    # 同步更新 store
-    gt = await _load_tasks()
-    gt.update_task(task.task_id, status=task.status, video_id=task.video_id)
-    await _save_tasks(gt)
-
+    # 需审批时不调用 API，等待审批通过后再创建
     if config.REQUIRE_ADMIN_APPROVAL:
-        # 发送审批消息
         manager_msg = (
             f"【视频生成申请】\n任务ID: {task.task_id}\n会话: {ctx.from_chat_key}\n"
             f"提示词: {prompt}\n模型: {model}\n尺寸: {width}x{height}\n"
@@ -307,9 +259,52 @@ async def create_video_task(
             await message.send_text(chat_key=target, message=manager_msg, ctx=ctx, record=False)
         except Exception as e:
             logger.error(f"发送审批消息失败: {e}")
-    else:
-        # 不需审批，直接进入队列等待轮询
-        asyncio.create_task(process_video_task(task.task_id))
+        return task
+
+    # 不需审批：立即调用 API 创建任务
+    try:
+        async with httpx.AsyncClient() as client:
+            created = await _req(client, "POST", "/v1/videos", payload)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"创建视频任务 API 调用失败: {error_msg}")
+        await update_task_status(task.task_id, TaskStatus.FAILED, error_message=error_msg)
+        chat_data = await _load_chat(ctx.from_chat_key)
+        if chat_data.current_task_id == task.task_id:
+            chat_data.current_task_id = None
+            await _save_chat(ctx.from_chat_key, chat_data)
+        raise
+
+    api_id = created.get("id")
+    api_video_id = created.get("video_id") or created.get("videoId")
+    api_st = str(created.get("status", "")) if created.get("status") is not None else None
+
+    logger.info(f"创建任务响应: id={api_id}, video_id={api_video_id}, status={api_st}")
+
+    # 用 API 返回的 id 更新 task_id（可能和本地生成的不同）
+    if api_id and api_id != task.task_id:
+        gt = await _load_tasks()
+        gt.tasks.pop(task.task_id, None)
+        task.task_id = api_id
+        gt.add_task(task)
+        await _save_tasks(gt)
+        chat_data = await _load_chat(ctx.from_chat_key)
+        if chat_data.current_task_id == task_id:
+            chat_data.current_task_id = api_id
+            await _save_chat(ctx.from_chat_key, chat_data)
+
+    if api_video_id:
+        task.video_id = api_video_id
+    if api_st:
+        task.status = TaskStatus.from_api(api_st)
+
+    # 同步更新 store
+    gt = await _load_tasks()
+    gt.update_task(task.task_id, status=task.status, video_id=task.video_id)
+    await _save_tasks(gt)
+
+    # 开始轮询
+    asyncio.create_task(process_video_task(task.task_id))
 
     return task
 
@@ -323,11 +318,11 @@ _APPROVABLE_STATUSES = {TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.APPROV
 
 
 async def approve_video_task(task_id: str) -> bool:
-    """批准视频任务: PENDING/QUEUED/APPROVED → APPROVED → 开始轮询
+    """批准视频任务: PENDING → APPROVED → 调用 API → 开始轮询
 
     接受多种状态:
-    - PENDING: 需审批模式下的初始状态
-    - QUEUED: API 返回的初始状态（审批通过但轮询未开始）
+    - PENDING: 需审批模式下的初始状态（未调用 API）
+    - QUEUED: 已调用 API 但未开始轮询
     - APPROVED: 已经批准但轮询可能已停止（重启后恢复）
     """
     gt = await _load_tasks()
@@ -335,9 +330,58 @@ async def approve_video_task(task_id: str) -> bool:
     if not task or task.status not in _APPROVABLE_STATUSES:
         logger.warning(f"批准失败: {task_id} 不存在或状态不可审批: {task.status if task else 'N/A'}")
         return False
-    # 只有非终态才需要更新（防止覆盖 CANCELED/REJECTED）
-    if task.status != TaskStatus.APPROVED:
+
+    # 如果还没有调用 API（PENDING 状态），先调用 API 创建任务
+    if task.status == TaskStatus.PENDING and not task.video_id:
+        logger.info(f"审批通过，调用 API 创建任务 {task_id}")
+        payload = _build_payload(
+            task.prompt, task.model, task.height, task.width,
+            task.num_frames, task.frame_rate,
+            None, None, None,  # nis, seed, neg — stored in task if needed
+            task.image_url, task.image_urls, task.mode,
+        )
+        try:
+            async with httpx.AsyncClient() as client:
+                created = await _req(client, "POST", "/v1/videos", payload)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"审批后 API 调用失败: {error_msg}")
+            await update_task_status(task_id, TaskStatus.FAILED, error_message=error_msg)
+            return False
+
+        api_id = created.get("id")
+        api_video_id = created.get("video_id") or created.get("videoId")
+        api_st = str(created.get("status", "")) if created.get("status") is not None else None
+
+        # 用 API 返回的 id 更新 task_id
+        if api_id and api_id != task_id:
+            gt = await _load_tasks()
+            gt.tasks.pop(task_id, None)
+            task.task_id = api_id
+            gt.add_task(task)
+            await _save_tasks(gt)
+            # 更新会话中的 task_id
+            chat_data = await _load_chat(task.chat_key)
+            if chat_data.current_task_id == task_id:
+                chat_data.current_task_id = api_id
+                await _save_chat(task.chat_key, chat_data)
+            task_id = api_id
+
+        if api_video_id:
+            task.video_id = api_video_id
+        task.status = TaskStatus.APPROVED
+        if api_st:
+            task.status = TaskStatus.from_api(api_st)
+
+        # 同步到 store
+        gt = await _load_tasks()
+        gt.update_task(task_id, status=task.status, video_id=task.video_id)
+        await _save_tasks(gt)
+
+    elif task.status != TaskStatus.APPROVED:
+        # QUEUED 状态，直接标记为 APPROVED
         await update_task_status(task_id, TaskStatus.APPROVED)
+
     asyncio.create_task(process_video_task(task_id))
     return True
 

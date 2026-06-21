@@ -75,8 +75,8 @@ def _hdrs() -> dict[str, str]:
 
 
 async def _req(client: httpx.AsyncClient, method: str, path: str, payload: Optional[Dict] = None) -> Dict[str, Any]:
-    base = config.BASE_URL.rstrip("/")
-    url = f"{base}/{path.lstrip('/')}"
+    base = config.BASE_URL.strip().rstrip("/")
+    url = f"{base}/{path.strip().lstrip('/')}"
     logger.debug(f"API 请求: {method} {url}")
     try:
         r = await (client.get(url, headers=_hdrs(), timeout=config.TIMEOUT) if method == "GET"

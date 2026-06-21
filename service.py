@@ -394,6 +394,11 @@ async def process_video_task(task_id: str) -> None:
 
             st = TaskStatus.from_api(data.get("status", ""))
 
+            # 非终态时同步更新本地状态（让 /agnes_info 能反映进度）
+            if not _is_terminal_status(st) and task.status != st:
+                task.status = st
+                await _save_tasks(gt)
+
             if st == TaskStatus.COMPLETED:
                 urls = extract_video_urls(data)
                 await update_task_status(task_id, TaskStatus.COMPLETED, video_urls=urls)

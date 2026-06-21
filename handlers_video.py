@@ -197,6 +197,7 @@ async def create_video(
         reason: Why the user wants this video. Shown during approval. Optional.
         image_urls: Input images for image-to-video. Single: ['url']. Multiple: ['url1','url2'].
             Supports HTTP(S) URL or Data URI (base64). Optional (omit for text-to-video).
+            Data URI example: ["data:image/png;base64,iVBORw0KGgo..."]
         mode: Generation mode. 'ti2vid' (image-to-video) or 'keyframes' (keyframe animation).
             Optional.
         height: Video height. Default 768.

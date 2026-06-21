@@ -55,7 +55,7 @@ async def generate_image(
         size: 尺寸 WIDTHxHEIGHT。默认 "1024x768"。
         image_urls: 输入图片列表，支持 HTTP(S) URL 或 Data URI (base64)。
             用于图生图/多图参考。默认 None（文生图）。
-            单图: ["https://example.com/img.png"]
+            单图: ["https://example.com/img.png"] 或 ["data:image/png;base64,..."]
             多图: ["https://a.png", "https://b.png"]
         translate_prompt: 是否自动翻译非英文提示词。默认 True。
         send_to_chat: 是否将生成的图片发送到当前聊天。默认 False。

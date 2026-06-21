@@ -5,6 +5,15 @@
 """
 
 from .conf import plugin
+from .service import (  # noqa: F401
+    approve_video_task,
+    reject_video_task,
+    cancel_current_video_task,
+    get_video_task,
+    get_video_by_task_id,
+    list_video_tasks,
+    get_video_task_info,
+)
 from .handlers_text import *  # noqa: F403
 from .handlers_image import *  # noqa: F403
 from .handlers_video import *  # noqa: F403

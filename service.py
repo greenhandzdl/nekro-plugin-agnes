@@ -278,12 +278,16 @@ async def create_video_task(
 
     if api_video_id:
         task.video_id = api_video_id
-    if api_st:
+
+    # 只有不需审批时，才用 API 返回的状态覆盖初始状态
+    # 需审批时保持 PENDING，等待管理员审批
+    if api_st and not config.REQUIRE_ADMIN_APPROVAL:
         task.status = TaskStatus.from_api(api_st)
-        # 同步更新 store
-        gt = await _load_tasks()
-        gt.update_task(task.task_id, status=task.status, video_id=task.video_id)
-        await _save_tasks(gt)
+
+    # 同步更新 store
+    gt = await _load_tasks()
+    gt.update_task(task.task_id, status=task.status, video_id=task.video_id)
+    await _save_tasks(gt)
 
     if config.REQUIRE_ADMIN_APPROVAL:
         # 发送审批消息

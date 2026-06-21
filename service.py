@@ -1,10 +1,9 @@
 """业务逻辑：任务管理、API 调用、异步视频处理
 
-对齐 tongyi_wanx 架构:
-- 会话级任务追踪 (ChatSessionData + current_task_id)
-- 全局任务存储 (GlobalTaskData)
-- 审批流程 (PENDING → APPROVED → PROCESSING → COMPLETED/FAILED)
-- 后台轮询 + 完成通知
+状态流转:
+  创建 → PENDING (需审批) / QUEUED (不需审批)
+  PENDING → APPROVED (审批通过) / REJECTED (审批拒绝)
+  APPROVED/QUEUED → PROCESSING (API 开始生成) → COMPLETED / FAILED
 """
 
 import asyncio
@@ -221,17 +220,19 @@ async def create_video_task(
     api_video_id = created.get("video_id") or created.get("videoId")
     api_st = str(created.get("status", "")) if created.get("status") is not None else None
 
-    logger.info(f"创建任务响应: id={api_id}, video_id={api_video_id}, status={api_st}, 完整响应={json.dumps(created, ensure_ascii=False)[:500]}")
+    logger.info(f"创建任务响应: id={api_id}, video_id={api_video_id}, status={api_st}")
+
+    # 初始状态: 需审批 → PENDING, 不需审批 → QUEUED
+    initial_status = TaskStatus.PENDING if config.REQUIRE_ADMIN_APPROVAL else TaskStatus.QUEUED
 
     task = VideoTask.create(
         task_id=api_id or task_id, chat_key=ctx.from_chat_key, prompt=prompt,
         reason=reason, model=model, height=height, width=width,
         num_frames=num_frames, frame_rate=frame_rate, image_url=img, image_urls=imgs, mode=mode,
     )
+    task.status = initial_status
     if api_video_id:
         task.video_id = api_video_id
-    if api_st:
-        task.status = TaskStatus.from_api(api_st)
 
     gt.add_task(task)
     await _save_tasks(gt)
@@ -241,6 +242,7 @@ async def create_video_task(
     await _save_chat(ctx.from_chat_key, chat_data)
 
     if config.REQUIRE_ADMIN_APPROVAL:
+        # 发送审批消息
         manager_msg = (
             f"【视频生成申请】\n任务ID: {task.task_id}\n会话: {ctx.from_chat_key}\n"
             f"提示词: {prompt}\n模型: {model}\n尺寸: {width}x{height}\n"
@@ -258,7 +260,7 @@ async def create_video_task(
         except Exception as e:
             logger.error(f"发送审批消息失败: {e}")
     else:
-        await update_task_status(task.task_id, TaskStatus.APPROVED)
+        # 不需审批，直接进入队列等待轮询
         asyncio.create_task(process_video_task(task.task_id))
 
     return task
@@ -269,15 +271,12 @@ async def create_video_task(
 # ---------------------------------------------------------------------------
 
 
-_APPROVABLE_STATUSES = {TaskStatus.QUEUED, TaskStatus.PENDING}
-
-
 async def approve_video_task(task_id: str) -> bool:
-    """批准视频任务（接受 QUEUED 和 PENDING 状态）"""
+    """批准视频任务: PENDING → APPROVED → 开始轮询"""
     gt = await _load_tasks()
     task = gt.get_task(task_id)
-    if not task or task.status not in _APPROVABLE_STATUSES:
-        logger.warning(f"批准失败: {task_id} 不存在或状态不可审批: {task.status if task else 'N/A'}")
+    if not task or task.status != TaskStatus.PENDING:
+        logger.warning(f"批准失败: {task_id} 不存在或状态非 PENDING (当前: {task.status if task else 'N/A'})")
         return False
     await update_task_status(task_id, TaskStatus.APPROVED)
     asyncio.create_task(process_video_task(task_id))
@@ -285,11 +284,11 @@ async def approve_video_task(task_id: str) -> bool:
 
 
 async def reject_video_task(task_id: str) -> bool:
-    """拒绝视频任务（接受 QUEUED 和 PENDING 状态）"""
+    """拒绝视频任务: PENDING → REJECTED (等同 CANCELED)"""
     gt = await _load_tasks()
     task = gt.get_task(task_id)
-    if not task or task.status not in _APPROVABLE_STATUSES:
-        logger.warning(f"拒绝失败: {task_id} 不存在或状态不可审批: {task.status if task else 'N/A'}")
+    if not task or task.status != TaskStatus.PENDING:
+        logger.warning(f"拒绝失败: {task_id} 不存在或状态非 PENDING (当前: {task.status if task else 'N/A'})")
         return False
     await update_task_status(task_id, TaskStatus.REJECTED, error_message="管理员拒绝了请求")
     return True
@@ -300,8 +299,13 @@ async def reject_video_task(task_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _is_terminal_status(status: TaskStatus) -> bool:
+    """是否为终态（不再轮询）"""
+    return status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.REJECTED)
+
+
 async def update_task_status(task_id: str, status: TaskStatus, **kwargs) -> None:
-    """更新任务状态，完成后清理会话并通知"""
+    """更新任务状态，终态时清理会话并通知"""
     gt = await _load_tasks()
     if not gt.update_task(task_id, status=status, **kwargs):
         return
@@ -311,10 +315,18 @@ async def update_task_status(task_id: str, status: TaskStatus, **kwargs) -> None
     if not task:
         return
 
+    # 终态处理
+    if _is_terminal_status(status):
+        # 清理会话中的 current_task_id
+        chat_data = await _load_chat(task.chat_key)
+        if chat_data.current_task_id == task_id:
+            chat_data.current_task_id = None
+            await _save_chat(task.chat_key, chat_data)
+
+    # 完成通知
     if status == TaskStatus.COMPLETED and task.video_urls:
         chat_data = await _load_chat(task.chat_key)
         chat_data.add_history(task.prompt, task.video_urls, task.task_id)
-        chat_data.current_task_id = None
         await _save_chat(task.chat_key, chat_data)
 
         msg = (
@@ -327,17 +339,21 @@ async def update_task_status(task_id: str, status: TaskStatus, **kwargs) -> None
         except Exception as e:
             logger.error(f"发送完成通知失败: {e}")
 
+    # 失败/拒绝通知
     elif status == TaskStatus.FAILED:
-        chat_data = await _load_chat(task.chat_key)
-        chat_data.current_task_id = None
-        await _save_chat(task.chat_key, chat_data)
-
         err = task.error_message or "未知错误"
         msg = f"【视频生成失败】\n任务ID: {task_id}\n提示词: {task.prompt}\n错误信息: {err}"
         try:
             await message_service.push_system_message(chat_key=task.chat_key, agent_messages=msg, trigger_agent=True)
         except Exception as e:
             logger.error(f"发送失败通知失败: {e}")
+
+    elif status == TaskStatus.REJECTED:
+        msg = f"【视频生成已拒绝】\n任务ID: {task_id}\n提示词: {task.prompt}\n管理员拒绝了请求。"
+        try:
+            await message_service.push_system_message(chat_key=task.chat_key, agent_messages=msg, trigger_agent=True)
+        except Exception as e:
+            logger.error(f"发送拒绝通知失败: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +362,10 @@ async def update_task_status(task_id: str, status: TaskStatus, **kwargs) -> None
 
 
 async def process_video_task(task_id: str) -> None:
-    """后台轮询视频任务状态（使用 video_id 轮询）"""
+    """后台轮询视频任务状态
+
+    轮询状态流转: QUEUED/APPROVED → PROCESSING → COMPLETED/FAILED
+    """
     gt = await _load_tasks()
     task = gt.get_task(task_id)
     if not task:
@@ -401,7 +420,7 @@ async def get_video_task(task_id: str) -> Optional[VideoTask]:
 
 
 async def cancel_current_video_task(chat_key: str) -> Optional[VideoTask]:
-    """取消当前会话的视频任务"""
+    """取消当前会话的视频任务（REJECTED 等同 CANCELED）"""
     chat_data = await _load_chat(chat_key)
     if not chat_data.current_task_id:
         return None
@@ -413,12 +432,14 @@ async def cancel_current_video_task(chat_key: str) -> Optional[VideoTask]:
         await _save_chat(chat_key, chat_data)
         return None
 
-    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELED, TaskStatus.REJECTED):
+    if _is_terminal_status(task.status):
         chat_data.current_task_id = None
         await _save_chat(chat_key, chat_data)
         return None
 
-    task.status = TaskStatus.CANCELED
+    # 使用 REJECTED 而非 CANCELED（等同处理）
+    task.status = TaskStatus.REJECTED
+    task.error_message = "用户取消"
     chat_data.current_task_id = None
     await _save_chat(chat_key, chat_data)
     await _save_tasks(gt)

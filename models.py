@@ -10,24 +10,35 @@ from .conf import config
 
 
 class TaskStatus(str, Enum):
-    """视频任务状态"""
+    """视频任务状态
 
-    QUEUED = "queued"       # API 返回的初始状态
-    PENDING = "pending"     # 等待管理员审批
-    APPROVED = "approved"   # 已批准，准备执行
-    REJECTED = "rejected"   # 已拒绝
-    PROCESSING = "processing"  # 执行中
-    COMPLETED = "completed"  # 已完成
-    FAILED = "failed"       # 失败
-    CANCELED = "canceled"   # 已取消
+    流转:
+    创建 → PENDING (需审批) / QUEUED (不需审批)
+    PENDING → APPROVED (审批通过) / REJECTED (审批拒绝)
+    APPROVED → PROCESSING (API 开始生成)
+    PROCESSING → COMPLETED (生成完成) / FAILED (生成失败)
+    QUEUED → PROCESSING → COMPLETED / FAILED
+    """
+
+    PENDING = "pending"       # 等待管理员审批
+    APPROVED = "approved"     # 已批准，准备/正在执行
+    REJECTED = "rejected"     # 已拒绝（等同 CANCELED）
+    QUEUED = "queued"         # 在队列中等待处理（API 初始状态）
+    PROCESSING = "processing"  # 正在生成
+    COMPLETED = "completed"   # 已完成
+    FAILED = "failed"         # 失败
 
     @classmethod
     def from_api(cls, status: str) -> "TaskStatus":
-        """从 API 返回的状态字符串转换，未知状态映射为 PROCESSING。"""
-        try:
-            return cls(status.lower())
-        except ValueError:
-            return cls.PROCESSING
+        """从 API 返回的状态字符串转换"""
+        mapping = {
+            "queued": cls.QUEUED,
+            "in_progress": cls.PROCESSING,
+            "processing": cls.PROCESSING,
+            "completed": cls.COMPLETED,
+            "failed": cls.FAILED,
+        }
+        return mapping.get(status.lower(), cls.PROCESSING)
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +53,7 @@ class VideoTask(BaseModel):
     chat_key: str
     prompt: str
     reason: Optional[str] = None
-    status: TaskStatus = TaskStatus.QUEUED
+    status: TaskStatus = TaskStatus.PENDING
     video_id: Optional[str] = None      # API 返回的 video_id，用于轮询
     video_urls: List[str] = Field(default_factory=list)
     error_message: Optional[str] = None

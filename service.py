@@ -76,13 +76,23 @@ def _hdrs() -> dict[str, str]:
 
 async def _req(client: httpx.AsyncClient, method: str, path: str, payload: Optional[Dict] = None) -> Dict[str, Any]:
     url = f"{config.BASE_URL}{path}"
+    logger.debug(f"API 请求: {method} {url}")
     try:
         r = await (client.get(url, headers=_hdrs(), timeout=config.TIMEOUT) if method == "GET"
                    else client.post(url, json=payload, headers=_hdrs(), timeout=config.TIMEOUT))
         r.raise_for_status()
-        return json.loads(r.text) if r.text else {}
+        text = r.text.strip()
+        if not text:
+            logger.warning(f"API 返回空内容: {url}")
+            return {}
+        logger.debug(f"API 响应: {text[:200]}")
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON 解析失败: {url}, 响应内容: {r.text[:200]!r}")
+        raise RuntimeError(f"JSON 解析失败 {url}: {e}") from e
     except httpx.HTTPStatusError as e:
         d = e.response.text if e.response is not None else str(e)
+        logger.error(f"HTTP 错误 {e.response.status_code}: {url}, 响应: {d[:200]}")
         raise RuntimeError(f"HTTP {e.response.status_code} from {path}: {d}") from e
     except httpx.RequestError as e:
         raise RuntimeError(f"请求 {path} 失败: {e}") from e

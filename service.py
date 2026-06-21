@@ -490,6 +490,18 @@ async def process_video_task(task_id: str) -> None:
     async with httpx.AsyncClient() as client:
         for i in range(config.MAX_POLL_ATTEMPTS):
             await asyncio.sleep(config.POLL_INTERVAL)
+
+            # 每次轮询前重新加载任务，检查是否已被取消或已达终态
+            gt = await _load_tasks()
+            task = gt.get_task(task_id)
+            if not task or _is_terminal_status(task.status):
+                logger.info(f"任务 {task_id} 已处于终态 {task.status.value if task else 'N/A'}，停止轮询")
+                return
+
+            # 重新计算 poll_url（task 对象的 video_id 可能在 approve 后被设置）
+            poll_id = task.video_id or task_id
+            poll_url = f"/agnesapi?video_id={poll_id}" if task.video_id else f"/v1/videos/{task_id}"
+
             try:
                 data = await _req(client, "GET", poll_url)
             except Exception as e:

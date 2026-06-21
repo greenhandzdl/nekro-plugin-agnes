@@ -36,6 +36,7 @@ from .service import (
     get_video_task,
     prepare_generation_prompt,
     validate_video_args,
+    _load_tasks,
 )
 
 
@@ -407,7 +408,6 @@ async def handle_approve(matcher: Matcher, event: MessageEvent, bot: Bot, arg: M
         return
 
     cmd_content = str(arg).strip() if arg else ""
-    from .service import _load_tasks
     gt = await _load_tasks()
     pending = [t for t in gt.get_all_tasks() if t.status == TaskStatus.PENDING]
 
@@ -445,7 +445,6 @@ async def handle_reject(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Me
         return
 
     cmd_content = str(arg).strip() if arg else ""
-    from .service import _load_tasks
     gt = await _load_tasks()
     pending = [t for t in gt.get_all_tasks() if t.status == TaskStatus.PENDING]
 

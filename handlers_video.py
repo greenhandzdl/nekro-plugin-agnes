@@ -1,9 +1,14 @@
 """视频生成工具 — 对齐 tongyi_wanx 架构
 
 方法类型:
-- BEHAVIOR: 创建/取消/审批/拒绝（Agent 触发，返回描述性文本）
-- TOOL: 查询/列表/详情（返回结构化结果）
+- BEHAVIOR: 创建/取消/审批/拒绝（Agent 触发，返回描述性文本，不触发再次调用）
+- TOOL: 查询/列表/详情（返回结构化结果，Agent 可继续处理）
 - on_command: 管理员命令（/agnes_y, /agnes_n, /agnes_list, /agnes_info）
+
+状态流转:
+  创建 → PENDING (需审批) / QUEUED (不需审批)
+  PENDING → APPROVED (审批通过) / REJECTED (审批拒绝)
+  APPROVED/QUEUED → PROCESSING (API 生成中) → COMPLETED / FAILED
 """
 
 import time
@@ -34,7 +39,7 @@ from .service import (
 
 
 # ---------------------------------------------------------------------------
-# 权限检查
+# 权限 + 工具
 # ---------------------------------------------------------------------------
 
 
@@ -50,13 +55,19 @@ def _get_user_id(event: MessageEvent) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Prompt 注入
+# Prompt 注入 — Agent 每次对话都会看到这段信息
 # ---------------------------------------------------------------------------
 
 
 @plugin.mount_prompt_inject_method(name="agnes_video_prompt_inject")
 async def agnes_video_prompt_inject(_ctx: AgentCtx):
-    """注入当前视频任务状态到 Agent 上下文"""
+    """注入当前视频任务状态到 Agent 上下文。
+
+    Agent 通过这段信息了解:
+    - 插件有哪些功能、怎么调用
+    - 当前是否有正在进行的任务
+    - 最近的历史记录
+    """
     if not _ctx.chat_key:
         return ""
 
@@ -68,7 +79,7 @@ async def agnes_video_prompt_inject(_ctx: AgentCtx):
     model = config.VIDEO_MODEL
     require_approval = config.REQUIRE_ADMIN_APPROVAL
 
-    # 当前任务
+    # 当前任务状态
     status_info = ""
     is_idle = True
     if chat_data.current_task_id:
@@ -83,6 +94,7 @@ async def agnes_video_prompt_inject(_ctx: AgentCtx):
                 f"- Prompt: {task.prompt}\n"
                 f"- Model: {task.model}\n"
                 f"- Size: {task.width}x{task.height}\n"
+                f"- Frames: {task.num_frames} @ {task.frame_rate}fps\n"
                 f"- Status: {task.status.value}\n"
                 f"- Start: {start_time}\n"
                 f"- Elapsed: {elapsed}s\n"
@@ -115,16 +127,30 @@ async def agnes_video_prompt_inject(_ctx: AgentCtx):
                 f"   VideoURL: {urls_str}\n"
             )
 
+    # 插件使用说明（Agent 通过这段文字学习如何调用）
     background_info = (
-        f"[Plugin Usage]\n"
-        f"- create_video(prompt, ..., reason=...) to request video.\n"
-        f"- get_video_by_task_id(task_id=...) to get video URL.\n"
-        f"- cancel_current_video_task() to cancel.\n"
-        f"- approve_video_task(task_id=...) / reject_video_task(task_id=...)\n"
-        f"- list_video_tasks(page=...) / get_video_task_info(task_id=...)\n"
-        f"- Model: {model}, approval: {'yes' if require_approval else 'no'}.\n"
-        f"- State: {'idle' if is_idle else 'busy'}.\n"
-        "Notice: Injected info is only visible to YOU, not to the user."
+        f"[Agnes Video Generation Plugin]\n"
+        f"Model: {model} | Approval: {'required' if require_approval else 'not required'} | State: {'idle' if is_idle else 'busy'}\n\n"
+        f"## Available Functions:\n"
+        f"1. create_video(prompt, image_urls=[...], mode=..., reason=...) -> str\n"
+        f"   Create a video generation task. Returns task_id and status.\n"
+        f"   - prompt: Video description (English works best, Chinese auto-translated)\n"
+        f"   - image_urls: Single ['url'] or multiple ['url1','url2'] for image-to-video\n"
+        f"   - mode: 'ti2vid' or 'keyframes' (optional)\n"
+        f"   - reason: Why the user wants this video (optional, shown for approval)\n\n"
+        f"2. get_video_by_task_id(task_id=...) -> str\n"
+        f"   Get the video URL for a completed task.\n\n"
+        f"3. cancel_current_video_task() -> str\n"
+        f"   Cancel the current session's active video task.\n\n"
+        f"4. approve_video_task(task_id=...) / reject_video_task(task_id=...) -> str\n"
+        f"   Approve or reject a pending video task.\n\n"
+        f"5. list_video_tasks(page=1) -> str\n"
+        f"   List all video tasks with pagination.\n\n"
+        f"6. get_video_task_info(task_id=...) -> str\n"
+        f"   Get detailed info of a specific task.\n\n"
+        f"## Status Flow:\n"
+        f"PENDING/QUEUED -> APPROVED -> PROCESSING -> COMPLETED/FAILED\n\n"
+        f"Note: Injected info is only visible to YOU, not to the user."
     )
 
     result = background_info + "\n" + status_info
@@ -158,7 +184,50 @@ async def create_video(
     negative_prompt: Optional[str] = None,
     translate_prompt: bool = True,
 ) -> str:
-    """创建 Agnes AI 视频生成任务（异步处理）。"""
+    """Create a video generation task.
+
+    Creates a video generation task with Agnes AI. The task will be queued for processing.
+    If admin approval is required, the task will wait for approval before starting.
+    If not, the task will start immediately.
+
+    Args:
+        prompt: Video description. Include subject, action, scene, style, camera, lighting.
+            English works best; Chinese will be auto-translated.
+            Example: "A cinematic shot of a cat walking on the beach at sunset"
+        reason: Why the user wants this video. Shown during approval. Optional.
+        image_urls: Input images for image-to-video. Single: ['url']. Multiple: ['url1','url2'].
+            Supports HTTP(S) URL or Data URI (base64). Optional (omit for text-to-video).
+        mode: Generation mode. 'ti2vid' (image-to-video) or 'keyframes' (keyframe animation).
+            Optional.
+        height: Video height. Default 768.
+        width: Video width. Default 1152.
+        num_frames: Frame count, must satisfy 8n+1 and <= 441. Default 121. Use 81 for quick test.
+        frame_rate: Frame rate 1-60. Default 24.
+        num_inference_steps: Inference steps. Optional (model default if not set).
+        seed: Random seed for reproducibility. Optional.
+        negative_prompt: Negative prompt. Optional.
+        translate_prompt: Auto-translate non-English prompts. Default True.
+
+    Returns:
+        Text describing task creation result, including task_id and status.
+        On failure, returns error message.
+
+    Examples:
+        Text-to-video:
+        create_video(prompt="A cat walking on the beach at sunset")
+
+        Image-to-video:
+        create_video(prompt="Animate subtle camera movement",
+                     image_urls=["https://example.com/image.png"])
+
+        Keyframe animation:
+        create_video(prompt="Smooth transition between keyframes",
+                     image_urls=["https://a.png", "https://b.png"],
+                     mode="keyframes")
+
+        With approval reason:
+        create_video(prompt="Funny cat video", reason="User wants a birthday gift")
+    """
     if not _ctx.chat_key:
         return "无法创建视频任务：未获取到聊天会话信息。"
 
@@ -217,7 +286,17 @@ async def create_video(
     description="取消当前会话的视频生成任务。",
 )
 async def cancel_current_video_task(_ctx: AgentCtx) -> str:
-    """取消当前会话的视频生成任务。"""
+    """Cancel the current session's video generation task.
+
+    Cancels the active video task for this session, if any.
+    The task status will be set to REJECTED.
+
+    Returns:
+        Text describing cancellation result.
+
+    Examples:
+        cancel_current_video_task()
+    """
     if not _ctx.chat_key:
         return "未获取到聊天会话信息。"
     task = await _cancel_task(_ctx.chat_key)
@@ -237,7 +316,17 @@ async def cancel_current_video_task(_ctx: AgentCtx) -> str:
     description="按任务 ID 获取视频 URL。",
 )
 async def get_video_by_task_id(_ctx: AgentCtx, task_id: str) -> str:
-    """按任务 ID 获取已完成视频任务的 URL。"""
+    """Get the video URL for a completed video generation task.
+
+    Args:
+        task_id: The task ID returned by create_video.
+
+    Returns:
+        Video URL string, or error message if task not found or not completed.
+
+    Examples:
+        get_video_by_task_id(task_id="task_123456")
+    """
     task = await get_video_task(task_id)
     if not task:
         return f"任务 {task_id} 不存在。"
@@ -247,7 +336,7 @@ async def get_video_by_task_id(_ctx: AgentCtx, task_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 管理命令 (on_command + BEHAVIOR)
+# 管理命令 (on_command)
 # ---------------------------------------------------------------------------
 
 

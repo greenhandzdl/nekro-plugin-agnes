@@ -105,7 +105,8 @@ async def generate_text(
 
 async def _handle_stream(client: httpx.AsyncClient, payload: Dict[str, Any]) -> str:
     """处理流式文本响应（SSE）。"""
-    base = config.BASE_URL.strip().rstrip("/")
+    from .service import _get_base_url
+    base = _get_base_url()
     url = f"{base}/v1/chat/completions"
     content_parts: List[str] = []
     event_count = 0

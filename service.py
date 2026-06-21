@@ -60,6 +60,11 @@ async def _save_chat(chat_key: str, data: ChatSessionData) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _get_base_url() -> str:
+    """获取清理后的 BASE_URL（去除末尾空格和 /）"""
+    return config.BASE_URL.strip().rstrip("/")
+
+
 def _key() -> str:
     if config.API_KEY:
         return config.API_KEY
@@ -75,7 +80,7 @@ def _hdrs() -> dict[str, str]:
 
 
 async def _req(client: httpx.AsyncClient, method: str, path: str, payload: Optional[Dict] = None) -> Dict[str, Any]:
-    base = config.BASE_URL.strip().rstrip("/")
+    base = _get_base_url()
     url = f"{base}/{path.strip().lstrip('/')}"
     logger.debug(f"API 请求: {method} {url}")
     try:

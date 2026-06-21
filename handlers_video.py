@@ -27,7 +27,8 @@ from nonebot.params import CommandArg
 from .conf import config, plugin
 from .models import TaskStatus
 from .service import (
-    approve_video_task,
+    approve_video_task as _approve_task,
+    reject_video_task as _reject_task,
     cancel_current_video_task as _cancel_task,
     create_video_task,
     format_task_info,
@@ -304,6 +305,62 @@ async def cancel_current_video_task(_ctx: AgentCtx) -> str:
     if not task:
         return "当前没有正在进行的视频任务。"
     return f"任务 {task.task_id} 已取消。"
+
+
+# ---------------------------------------------------------------------------
+# 审批/拒绝 (BEHAVIOR)
+# ---------------------------------------------------------------------------
+
+
+@plugin.mount_sandbox_method(
+    SandboxMethodType.BEHAVIOR,
+    name="approve_video_task",
+    description="批准一个待审批的视频生成任务。",
+)
+async def approve_video_task(_ctx: AgentCtx, task_id: str) -> str:
+    """Approve a pending video generation task.
+
+    Transitions task from PENDING to APPROVED status and starts polling.
+    Accepts PENDING, QUEUED, or APPROVED states.
+
+    Args:
+        task_id: The task ID to approve.
+
+    Returns:
+        Text describing approval result.
+
+    Examples:
+        approve_video_task(task_id="task_123456")
+    """
+    success = await _approve_task(task_id)
+    if success:
+        return f"已批准任务 {task_id}，开始执行视频生成。"
+    return f"批准任务 {task_id} 失败，请检查任务状态。"
+
+
+@plugin.mount_sandbox_method(
+    SandboxMethodType.BEHAVIOR,
+    name="reject_video_task",
+    description="拒绝一个待审批的视频生成任务。",
+)
+async def reject_video_task(_ctx: AgentCtx, task_id: str) -> str:
+    """Reject a pending video generation task.
+
+    Transitions task from PENDING to REJECTED status.
+
+    Args:
+        task_id: The task ID to reject.
+
+    Returns:
+        Text describing rejection result.
+
+    Examples:
+        reject_video_task(task_id="task_123456")
+    """
+    success = await _reject_task(task_id)
+    if success:
+        return f"已拒绝任务 {task_id}。"
+    return f"拒绝任务 {task_id} 失败，请检查任务状态。"
 
 
 # ---------------------------------------------------------------------------

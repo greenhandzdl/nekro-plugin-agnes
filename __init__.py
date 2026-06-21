@@ -10,9 +10,6 @@ from .service import (  # noqa: F401
     reject_video_task,
     cancel_current_video_task,
     get_video_task,
-    get_video_by_task_id,
-    list_video_tasks,
-    get_video_task_info,
 )
 from .handlers_text import *  # noqa: F403
 from .handlers_image import *  # noqa: F403
@@ -30,4 +27,12 @@ __all__ = [
     "get_video_by_task_id",
     "list_video_tasks",
     "get_video_task_info",
+    "create_video_task",
+    "process_video_task",
+    "update_task_status",
+    "format_task_info",
+    "get_tasks_page",
+    "extract_video_urls",
+    "validate_video_args",
+    "prepare_generation_prompt",
 ]

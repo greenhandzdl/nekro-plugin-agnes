@@ -281,14 +281,25 @@ async def create_video_task(
 # ---------------------------------------------------------------------------
 
 
+_APPROVABLE_STATUSES = {TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.APPROVED}
+
+
 async def approve_video_task(task_id: str) -> bool:
-    """批准视频任务: PENDING → APPROVED → 开始轮询"""
+    """批准视频任务: PENDING/QUEUED/APPROVED → APPROVED → 开始轮询
+
+    接受多种状态:
+    - PENDING: 需审批模式下的初始状态
+    - QUEUED: API 返回的初始状态（审批通过但轮询未开始）
+    - APPROVED: 已经批准但轮询可能已停止（重启后恢复）
+    """
     gt = await _load_tasks()
     task = gt.get_task(task_id)
-    if not task or task.status != TaskStatus.PENDING:
-        logger.warning(f"批准失败: {task_id} 不存在或状态非 PENDING (当前: {task.status if task else 'N/A'})")
+    if not task or task.status not in _APPROVABLE_STATUSES:
+        logger.warning(f"批准失败: {task_id} 不存在或状态不可审批: {task.status if task else 'N/A'}")
         return False
-    await update_task_status(task_id, TaskStatus.APPROVED)
+    # 只有非终态才需要更新（防止覆盖 CANCELED/REJECTED）
+    if task.status != TaskStatus.APPROVED:
+        await update_task_status(task_id, TaskStatus.APPROVED)
     asyncio.create_task(process_video_task(task_id))
     return True
 

@@ -9,10 +9,8 @@
 import time
 from typing import List, Optional
 
-from nekro_agent.api import message as nb_message
 from nekro_agent.api.core import logger
 from nekro_agent.api.schemas import AgentCtx
-from nekro_agent.services.message_service import message_service
 from nekro_agent.services.plugin.base import SandboxMethodType
 from nekro_agent.tools.common_util import limited_text_output
 from nonebot import on_command
@@ -44,29 +42,6 @@ def _get_super_users() -> set[str]:
     """获取 SUPER_USERS 配置"""
     from nekro_agent.core.config import config as global_config
     return {str(uid) for uid in getattr(global_config, "SUPER_USERS", [])}
-
-
-async def _check_admin(event: MessageEvent, matcher: Matcher) -> tuple[str, str]:
-    """检查管理员权限，返回 (user_id, cmd_content)"""
-    user_id = str(event.user_id)
-    super_users = _get_super_users()
-
-    if user_id not in super_users:
-        logger.warning(f"用户 {user_id} 不在 SUPER_USERS 中，拒绝执行命令")
-        await matcher.finish()
-
-    cmd_content = str(arg).strip() if (arg := None) else ""  # placeholder, overridden below
-    return user_id, cmd_content
-
-
-def _get_chat_key(event: MessageEvent) -> str:
-    """从 nonebot2 事件获取 chat_key"""
-    if isinstance(event, PrivateMessageEvent):
-        return f"private_{event.user_id}"
-    if isinstance(event, GroupMessageEvent):
-        return f"group_{event.group_id}"
-    # fallback
-    return getattr(event, "chat_key", f"unknown_{event.user_id}")
 
 
 def _get_user_id(event: MessageEvent) -> str:
@@ -274,18 +249,6 @@ async def get_video_by_task_id(_ctx: AgentCtx, task_id: str) -> str:
 # ---------------------------------------------------------------------------
 # 管理命令 (on_command + BEHAVIOR)
 # ---------------------------------------------------------------------------
-
-
-async def _admin_command_handler(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Message = CommandArg()):
-    """管理员命令通用入口：权限检查 + 获取参数"""
-    user_id = _get_user_id(event)
-    super_users = _get_super_users()
-    if user_id not in super_users:
-        logger.warning(f"用户 {user_id} 不在 SUPER_USERS 中")
-        await matcher.finish()
-        return
-    cmd = str(arg).strip() if arg else ""
-    await matcher.finish()  # placeholder — each handler calls this differently
 
 
 @on_command("agnes_y", aliases={"agnes-y"}, priority=5, block=True).handle()

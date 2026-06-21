@@ -305,8 +305,15 @@ def _is_terminal_status(status: TaskStatus) -> bool:
 
 
 async def update_task_status(task_id: str, status: TaskStatus, **kwargs) -> None:
-    """更新任务状态，终态时清理会话并通知"""
+    """更新任务状态，终态时清理会话并通知。不允许从终态转移到其他状态。"""
     gt = await _load_tasks()
+    existing = gt.get_task(task_id)
+    if not existing:
+        return
+    # 终态不可覆盖（防止取消后被轮询覆盖）
+    if _is_terminal_status(existing.status) and not _is_terminal_status(status):
+        logger.warning(f"任务 {task_id} 已是终态 {existing.status.value}，不允许更新为 {status.value}")
+        return
     if not gt.update_task(task_id, status=status, **kwargs):
         return
     await _save_tasks(gt)
@@ -430,8 +437,7 @@ async def cancel_current_video_task(chat_key: str) -> Optional[VideoTask]:
     if not chat_data.current_task_id:
         return None
 
-    gt = await _load_tasks()
-    task = gt.get_task(chat_data.current_task_id)
+    task = await get_video_task(chat_data.current_task_id)
     if not task:
         chat_data.current_task_id = None
         await _save_chat(chat_key, chat_data)
@@ -443,11 +449,19 @@ async def cancel_current_video_task(chat_key: str) -> Optional[VideoTask]:
         return None
 
     # 使用 REJECTED 而非 CANCELED（等同处理）
-    task.status = TaskStatus.REJECTED
-    task.error_message = "用户取消"
-    chat_data.current_task_id = None
-    await _save_chat(chat_key, chat_data)
-    await _save_tasks(gt)
+    # 通过 update_task_status 确保后台轮询也能看到状态变化
+    await update_task_status(
+        chat_data.current_task_id,
+        TaskStatus.REJECTED,
+        error_message="用户取消",
+    )
+
+    # 清理会话
+    chat_data = await _load_chat(chat_key)
+    if chat_data.current_task_id == task.task_id:
+        chat_data.current_task_id = None
+        await _save_chat(chat_key, chat_data)
+
     return task
 
 

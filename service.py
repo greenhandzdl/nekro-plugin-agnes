@@ -387,11 +387,11 @@ async def approve_video_task(task_id: str) -> bool:
 
 
 async def reject_video_task(task_id: str) -> bool:
-    """拒绝视频任务: PENDING → REJECTED (等同 CANCELED)"""
+    """拒绝视频任务: PENDING/QUEUED → REJECTED (等同 CANCELED)"""
     gt = await _load_tasks()
     task = gt.get_task(task_id)
-    if not task or task.status != TaskStatus.PENDING:
-        logger.warning(f"拒绝失败: {task_id} 不存在或状态非 PENDING (当前: {task.status if task else 'N/A'})")
+    if not task or task.status not in (TaskStatus.PENDING, TaskStatus.QUEUED):
+        logger.warning(f"拒绝失败: {task_id} 不存在或状态不可拒绝 (当前: {task.status if task else 'N/A'})")
         return False
     await update_task_status(task_id, TaskStatus.REJECTED, error_message="管理员拒绝了请求")
     return True
@@ -507,6 +507,9 @@ async def process_video_task(task_id: str) -> None:
             # 非终态时同步更新本地状态（让 /agnes_info 能反映进度）
             if not _is_terminal_status(st) and task.status != st:
                 task.status = st
+                # 重新加载 gt 确保不与 cancel/approve 冲突
+                gt = await _load_tasks()
+                gt.update_task(task_id, status=st)
                 await _save_tasks(gt)
 
             if st == TaskStatus.COMPLETED:

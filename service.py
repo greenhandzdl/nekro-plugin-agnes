@@ -356,7 +356,7 @@ async def process_video_task(task_id: str) -> None:
     poll_id = task.video_id or task_id
     poll_url = f"/agnesapi?video_id={poll_id}" if task.video_id else f"/v1/videos/{task_id}"
 
-    logger.info(f"开始轮询任务 {task_id} (poll_id={poll_id}): {task.prompt}")
+    logger.info(f"开始轮询任务 {task_id} (video_id={task.video_id}, poll_url={poll_url}): {task.prompt}")
 
     async with httpx.AsyncClient() as client:
         for i in range(config.MAX_POLL_ATTEMPTS):
@@ -366,6 +366,8 @@ async def process_video_task(task_id: str) -> None:
             except Exception as e:
                 logger.warning(f"轮询 {task_id} 第 {i + 1} 次失败: {e}")
                 continue
+
+            logger.info(f"轮询 {task_id} 第 {i + 1} 次响应: {json.dumps(data, ensure_ascii=False)[:300]}")
 
             if data.get("error"):
                 await update_task_status(task_id, TaskStatus.FAILED, error_message=json.dumps(data["error"], ensure_ascii=False))

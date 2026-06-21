@@ -15,4 +15,10 @@ __all__ = [
     "generate_image",
     "create_video",
     "get_video",
+    "cancel_current_video_task",
+    "approve_video_task",
+    "reject_video_task",
+    "get_video_by_task_id",
+    "list_video_tasks",
+    "get_video_task_info",
 ]

@@ -77,13 +77,17 @@ async def check_video(client):
 
     path = service._poll_path(video_id, VIDEO_MODEL)
     deadline = time.time() + 600
+    # 实测 2.5 队列态会经过 queued / pending / in_progress，只有 completed|failed 是终态
+    non_terminal = ("queued", "pending", "in_progress", "processing")
     n = 0
+    data = {}
+    st = ""
     while time.time() < deadline:
         await asyncio.sleep(2)
         n += 1
         data = await service._req(client, "GET", path)
         st = str(data.get("status", "")).lower()
-        if st not in ("queued", "in_progress"):
+        if st not in non_terminal:
             print(f"[video] poll#{n} status={st}")
             break
         if n % 15 == 0:

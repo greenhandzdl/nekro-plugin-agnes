@@ -186,6 +186,8 @@ class TestParseProgress:
 class TestTaskStatusFromApi:
     def test_mapping(self):
         assert TaskStatus.from_api("queued") == TaskStatus.QUEUED
+        # 实测 agnes-video-2.5-flash 创建后先回 "pending" 再回 "in_progress"
+        assert TaskStatus.from_api("pending") == TaskStatus.QUEUED
         assert TaskStatus.from_api("in_progress") == TaskStatus.PROCESSING
         assert TaskStatus.from_api("completed") == TaskStatus.COMPLETED
         assert TaskStatus.from_api("failed") == TaskStatus.FAILED

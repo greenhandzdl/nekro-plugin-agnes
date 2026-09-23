@@ -390,3 +390,24 @@ async def test_load_tasks_tolerates_v1_null_fields(env):
     assert task.size == "720P"
     assert task.aspect_ratio == "16:9"
     assert task.status is TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_recover_marks_pre_migration_tasks_failed(env):
+    """1.x 遗留任务没有 video_id 且模型已下线，恢复阶段不能重新提交。"""
+    gt = GlobalTaskData()
+    old = VideoTask.create(task_id="task_000001", chat_key=CHAT, prompt="a", model="agnes-video-v2.0")
+    old.status = TaskStatus.PROCESSING
+    new = VideoTask.create(task_id="task_000002", chat_key=CHAT, prompt="b", model="agnes-video-2.5-flash")
+    new.status = TaskStatus.PENDING
+    gt.add_task(old)
+    gt.add_task(new)
+    await service._save_tasks(gt)
+
+    n = await service.recover_unfinished_tasks()
+    assert n == 1
+    assert env.api.started == ["task_000002"]
+
+    gt2 = await service._load_tasks()
+    assert gt2.get_task("task_000001").status is TaskStatus.FAILED
+    assert "2.5" in (gt2.get_task("task_000001").error_message or "")

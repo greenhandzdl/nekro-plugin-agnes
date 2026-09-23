@@ -313,6 +313,7 @@ def build_video_payload(
     videos: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """构建 POST /v1/videos 请求体（Agnes Video 2.5 系列）。"""
+    model = _normalize_video_model(model)
     p: Dict[str, Any] = {
         "model": model, "prompt": prompt, "mode": mode,
         "seconds": str(seconds), "size": size, "aspect_ratio": aspect_ratio,
@@ -676,6 +677,20 @@ async def _send_approval_request(task: VideoTask) -> None:
 async def recover_unfinished_tasks() -> int:
     """插件启动时恢复未到终态的视频任务。返回恢复数量。"""
     gt = await _load_tasks()
+    legacy = [
+        t for t in gt.get_all_tasks()
+        if not _is_terminal_status(t.status) and not t.model.startswith("agnes-video-2.5")
+    ]
+    if legacy:
+        for t in legacy:
+            gt.update_task(
+                t.task_id, status=TaskStatus.FAILED,
+                error_message="插件已升级到 Agnes Video 2.5 系列，1.x 任务无 video_id 可续轮询",
+            )
+        await _save_tasks(gt)
+        ids = ", ".join(t.task_id for t in legacy[:5])
+        logger.warning(f"{len(legacy)} 个 1.x 遗留任务已标记失败（模型已下线）: {ids}")
+
     recovered = 0
     for t in gt.get_all_tasks():
         if _is_terminal_status(t.status):

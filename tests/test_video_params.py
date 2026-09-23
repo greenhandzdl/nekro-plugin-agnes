@@ -56,6 +56,10 @@ class TestBuildPayload:
             "seconds": "5", "size": "720P", "aspect_ratio": "16:9",
         }
 
+    def test_retired_model_normalized(self):
+        p = build_video_payload("cat", "agnes-video-v2.0", "ti2vid", "5", "720P", "16:9")
+        assert p["model"] == "agnes-video-2.5-flash"
+
     def test_keyframe_payload(self):
         p = build_video_payload("t", "m", "keyframe", "4", "720P", "1:1",
                                 first_frame="a.png", last_frame="b.png", seed=42)

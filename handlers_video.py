@@ -586,7 +586,7 @@ async def cmd_info(
 async def cmd_help(context: CommandExecutionContext) -> CommandResponse:
     approval_status = "开启" if config.REQUIRE_ADMIN_APPROVAL else "关闭"
     help_text = (
-        f"🎬 Agnes AI 视频生成插件 v2.0.0\n\n"
+        f"🎬 Agnes AI 视频生成插件 v{plugin.version}\n\n"
         f"📋 管理员命令 (需要 SUPER_USERS 权限):\n"
         f"  /agnes_y [task_id] — 批准视频任务\n"
         f"  /agnes_n [task_id] — 拒绝视频任务\n"

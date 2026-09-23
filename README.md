@@ -27,7 +27,7 @@
 
 - 命令系统：`plugin.mount_command` + `nekro_agent.services.command`（`CommandPermission`、`CmdCtl`、`Arg`、`CommandExecutionContext`、`CommandResponse`）
 - 异步任务：`plugin.mount_async_task` + `nekro_agent.services.plugin.task`（`task`、`TaskCtl`、`AsyncTaskHandle`），视频轮询与重启恢复都走这里
-- 其余：`mount_sandbox_method` / `mount_init_method` / `mount_cleanup_method` / `mount_prompt_inject_method`、`store.get/set`、`push_system`
+- 其余：`mount_sandbox_method` / `mount_init_method` / `mount_cleanup_method` / `mount_prompt_inject_method`、`api.message.push_system`，以及插件自己的 `plugin.store.get/set`（`PluginStore` 走框架 ORM，只能在 app 进程里用，独立脚本驱动不了任务表）
 
 不再依赖 nonebot。`mount_command` 在框架 2.3.0 就已存在，但本插件只在 2.4.0 上验证过；回落到 2.3.x 需自测命令注册。
 

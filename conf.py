@@ -5,7 +5,7 @@ plugin = NekroPlugin(
     name="Agnes AI Generation",
     module_name="agnes_ai_generation",
     description="通过 Agnes AI API 进行文本、图片和视频生成",
-    version="2.0.0",
+    version="2.0.1",
     author="greenhandzdl",
     url="https://github.com/greenhandzdl/nekro-plugin-agnes",
 )

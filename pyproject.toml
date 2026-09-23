@@ -1,6 +1,6 @@
 [project]
 name = "nekro-plugin-agnes"
-version = "2.0.0"
+version = "2.0.1"
 description = "Agnes AI 文本、图片、视频生成插件（Video 2.5 系列 + 框架命令/任务系统）"
 authors = [{ name = "greenhandzdl", email = "greenhandzdl@gmail.com" }]
 readme = "README.md"

@@ -371,3 +371,22 @@ async def test_recover_unfinished_tasks(env):
     n = await service.recover_unfinished_tasks()
     assert n == 1  # 只恢复 PROCESSING，COMPLETED 跳过
     assert env.api.started == ["task_000001"]
+
+
+@pytest.mark.asyncio
+async def test_load_tasks_tolerates_v1_null_fields(env):
+    """1.1.0 落盘的任务记录把 model/mode 等字段写成了 null，加载不能整体失败。"""
+    legacy = (
+        '{"tasks":{"task_000001":{"task_id":"task_000001","chat_key":"c1","prompt":"a",'
+        '"reason":null,"status":"completed","video_id":"v1","video_urls":["u"],'
+        '"error_message":null,"create_time":1,"update_time":2,"model":null,"mode":null,'
+        '"seconds":null,"size":null,"aspect_ratio":null}},"task_counter":1}'
+    )
+    env.store.data[("global", service._STORE_TASKS)] = legacy
+    gt = await service._load_tasks()
+    task = gt.get_task("task_000001")
+    assert task.mode == "text"
+    assert task.seconds == "5"
+    assert task.size == "720P"
+    assert task.aspect_ratio == "16:9"
+    assert task.status is TaskStatus.COMPLETED

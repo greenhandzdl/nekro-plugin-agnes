@@ -4,7 +4,7 @@ import time
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from .conf import config
 
@@ -72,6 +72,12 @@ class VideoTask(BaseModel):
     image_urls: Optional[List[str]] = None   # reference 模式参考图片
     audio_urls: Optional[List[str]] = None   # reference 模式参考音频
     video_refs: Optional[List[Dict[str, Any]]] = None  # reference 模式参考视频对象
+
+    @field_validator("model", "mode", "seconds", "size", "aspect_ratio", mode="before")
+    @classmethod
+    def _null_to_default(cls, value: Any, info: ValidationInfo) -> Any:
+        """1.1.0 落盘的任务记录里这些字段显式为 null，而 pydantic 不会给显式 None 套默认值。"""
+        return cls.model_fields[info.field_name].default if value is None else value
 
     @classmethod
     def create(

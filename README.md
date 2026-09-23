@@ -137,7 +137,7 @@ PENDING → APPROVED (审批通过) / REJECTED (拒绝/超时)
 APPROVED/QUEUED → PROCESSING (API 生成中) → COMPLETED / FAILED
 ```
 
-任务进入终态时会以系统消息唤醒 Agent（`notify_agent(trigger=True)`）把结果播报给用户。副作用要注意：免费档队列拥塞时失败是常态，如果提示词里要求"失败就重试"，Agent 会连续刷创建（2026-09-23 实测：6 分钟内 task_000007→task_000017 共 11 次 create，全部 503/429），把免费配额刷干。这不是插件在自循环，但重试策略要在会话层面收口。
+任务进入终态时会以系统消息唤醒 Agent（`notify_agent(trigger=True)`）把结果播报给用户。副作用要注意：`trigger=True` 本身就足以让 Agent 自己再发起一次创建，**不需要提示词里写"失败就重试"**。2026-09-23 实测：往会话里发过一条"直接调用 create_video、不要调用其他工具"的指令后，Agent 从 `task_000018` 一路建到 `task_000028`，任务总数从 40 涨到 51，最后一条创建发生在测试脚本退出约 4 分钟后（22:15:19 退出，22:19:37 仍在建）——放大完全发生在会话层面，插件每次只提交一个请求。这不是插件在自循环，但重试策略要在会话层面收口。
 
 ### 从 v1.x 升级 / 回退到 v1.x
 
@@ -174,6 +174,16 @@ python scripts/live_smoke.py --skip-video
 ```
 
 免费档的真实限制（2026-09-23 实测）：视频创建经常返回 `503 video_queue_full`，短时间内连续调用会转成 `429 … rate limit for free users`。这两类都是提供方的容量/配额限制，不是插件报错，等队列放开后重试即可；请求参数被拒时返回的是 `400`（例如把 2.5 的请求体发给 `agnes-video-v2.0`）。
+
+2.0.x 在真实实例（NekroAgent 2.4.0 / Python 3.11.13，插件 `2.0.3`，重启后 `loadFailed: false`，`agnes_help/agnes_info/agnes_list/agnes_y/agnes_n` 五个命令注册成功）上的覆盖情况：
+
+- 免费文本与图片：`agnes-2.5-flash` 文本、流式、多模态输入，`agnes-image-2.5-flash` 文生图与图生图，5 项全通过。
+- 视频成功路径跑通过一次：`task_000001`（`text` 模式 / 4s / 720P / 16:9）21:29:32 创建、21:33:25 完成，产出的 URL 是一个 1459161 字节的 h264+aac 文件，`ffprobe` 读出 1280x720@24fps、4.48s——与请求参数一致。
+- 但同一形态在 21:37 之后被反复挡住：逐条读到的 28 条 2.x 任务记录里 27 条 `failed`，错误信息统一是 `503 video_queue_full`。队列放开与否看起来是几分钟尺度的随机窗口。
+- 任务链路与命令：`create_video` → 框架异步任务 → 提交 → 记 `FAILED` → 会话系统通知，全程在真实 app 进程里走通；`/agnes_info` 能读到含 `video_queue_full` 原文的完整记录，`/agnes_y` 对终态任务正确拒绝。
+- 未覆盖：`keyframe` 与 `reference` 两种模式从未成功创建过任务（上面 28 条 2.x 记录的模式全是 `text`），它们的提交与轮询只有离线单测；管理员审批分支同样只有单测（该实例 `REQUIRE_ADMIN_APPROVAL: false`，任务直接进 `QUEUED`）。
+- 启动恢复路径也只有单测：本实例上 1.x 遗留记录全是终态（15 completed / 3 failed），"把非 2.5 的非终态任务一次性标 `FAILED`" 那段逻辑从 09-21 起的容器日志里从没被触发过。
+- 1.x 历史数据：升级前建的 18 条 `task_<32位>` 形式记录在 2.x 里照常可读（15 条 `completed`、3 条 `failed`），上面的数字是按新命名 `task_0000NN` 过滤后统计的。
 
 ## API 参考
 

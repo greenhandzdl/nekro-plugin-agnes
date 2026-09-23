@@ -394,7 +394,7 @@ async def test_load_tasks_tolerates_v1_null_fields(env):
 
 @pytest.mark.asyncio
 async def test_recover_marks_pre_migration_tasks_failed(env):
-    """1.x 遗留任务没有 video_id 且模型已下线，恢复阶段不能重新提交。"""
+    """1.x 遗留任务没有 video_id 且其模型形态已不受支持，恢复阶段不能重新提交。"""
     gt = GlobalTaskData()
     old = VideoTask.create(task_id="task_000001", chat_key=CHAT, prompt="a", model="agnes-video-v2.0")
     old.status = TaskStatus.PROCESSING

@@ -5,7 +5,7 @@ plugin = NekroPlugin(
     name="Agnes AI Generation",
     module_name="agnes_ai_generation",
     description="通过 Agnes AI API 进行文本、图片和视频生成",
-    version="2.0.2",
+    version="2.0.3",
     author="greenhandzdl",
     url="https://github.com/greenhandzdl/nekro-plugin-agnes",
 )
@@ -43,7 +43,7 @@ class AgnesConfig(ConfigBase):
     VIDEO_MODEL: str = Field(
         default="agnes-video-2.5-flash",
         title="视频模型",
-        description="视频生成使用的模型名称。agnes-video-2.5-flash 限时免费（仅 720P、不支持视频参考）；agnes-video-2.5 付费（支持参考视频、最高 2K）。agnes-video-v2.0 已于 2026-09-25 下线",
+        description="视频生成使用的模型名称。agnes-video-2.5-flash 限时免费（仅 720P、不支持视频参考）；agnes-video-2.5 付费（支持参考视频、最高 2K）。旧版 agnes-video-v2.0 需要已移除的 ti2vid/keyframes/multi_reference 参数形态，配置它会归一到 2.5-flash",
     )
     POLL_INTERVAL: int = Field(
         default=2,

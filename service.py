@@ -44,20 +44,24 @@ _TR_SYS = (
 
 
 # ---------------------------------------------------------------------------
-# 旧配置兼容：已废弃/下线模型归一
+# 旧配置兼容：v2.x 不再构建的模型归一
 # ---------------------------------------------------------------------------
 
 
 def _normalize_video_model(model: str) -> str:
-    """agnes-video-v2.0 已于 2026-09-25 下线，自动归一到 2.5-flash（免费）。"""
+    """旧配置的 agnes-video-v2.0 归一到 2.5-flash（免费）。
+
+    v2.0 仍能在 GET /v1/models 里列到，但它要求旧的 ti2vid/keyframes/
+    multi_reference 参数形态，本插件已不再构建这类请求。
+    """
     if not model or model.startswith("agnes-video-v2.0"):
-        logger.warning(f"视频模型 {model!r} 已下线，自动改用 agnes-video-2.5-flash")
+        logger.warning(f"视频模型 {model!r} 不再受支持，自动改用 agnes-video-2.5-flash")
         return "agnes-video-2.5-flash"
     return model
 
 
 def _normalize_text_model(model: str) -> str:
-    """agnes-2.0-flash 已废弃，归一到 agnes-2.5-flash。"""
+    """1.x 默认模型 agnes-2.0-flash 归一到 agnes-2.5-flash。"""
     if not model or model == "agnes-2.0-flash":
         return "agnes-2.5-flash"
     return model
@@ -689,7 +693,7 @@ async def recover_unfinished_tasks() -> int:
             )
         await _save_tasks(gt)
         ids = ", ".join(t.task_id for t in legacy[:5])
-        logger.warning(f"{len(legacy)} 个 1.x 遗留任务已标记失败（模型已下线）: {ids}")
+        logger.warning(f"{len(legacy)} 个 1.x 遗留任务已标记失败（插件不再支持其模型与参数形态）: {ids}")
 
     recovered = 0
     for t in gt.get_all_tasks():

@@ -1,9 +1,9 @@
-"""视频生成工具 — 对齐 tongyi_wanx 架构
+"""视频生成工具 — Agnes Video 2.5 系列 + 框架命令/任务系统
 
 方法类型:
 - BEHAVIOR: 创建/取消/审批/拒绝（Agent 触发，返回描述性文本，不触发再次调用）
 - TOOL: 查询/列表/详情（返回结构化结果，Agent 可继续处理）
-- on_command: 管理员命令（/agnes_y, /agnes_n, /agnes_list, /agnes_info）
+- mount_command: 管理员命令（/agnes_y, /agnes_n, /agnes_list, /agnes_info, /agnes_help）
 
 状态流转:
   创建 → PENDING (需审批) / QUEUED (不需审批)
@@ -12,48 +12,46 @@
 """
 
 import time
-from typing import List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
+import httpx
 from nekro_agent.api.core import logger
 from nekro_agent.api.schemas import AgentCtx
+from nekro_agent.services.command.base import CommandPermission
+from nekro_agent.services.command.ctl import CmdCtl
+from nekro_agent.services.command.schemas import Arg, CommandExecutionContext, CommandResponse
 from nekro_agent.services.plugin.base import SandboxMethodType
 from nekro_agent.tools.common_util import limited_text_output
-from nonebot import on_command
-from nonebot.adapters import Bot, Message
-from nonebot.adapters.onebot.v11 import MessageEvent, PrivateMessageEvent, GroupMessageEvent
-from nonebot.matcher import Matcher
-from nonebot.params import CommandArg
 
 from .conf import config, plugin
 from .models import TaskStatus
 from .service import (
+    _load_chat,
+    _load_tasks,
     approve_video_task as _approve_task,
-    reject_video_task as _reject_task,
     cancel_current_video_task as _cancel_task,
     create_video_task,
+    derive_mode,
     format_task_info,
     get_tasks_page,
     get_video_task,
     prepare_generation_prompt,
-    validate_video_args,
-    _load_tasks,
+    recover_unfinished_tasks,
+    reject_video_task as _reject_task,
 )
 
 
 # ---------------------------------------------------------------------------
-# 权限 + 工具
+# 启动恢复 — 插件重载/框架重启后续跑未终态任务
 # ---------------------------------------------------------------------------
 
 
-def _get_super_users() -> set[str]:
-    """获取 SUPER_USERS 配置"""
-    from nekro_agent.core.config import config as global_config
-    return {str(uid) for uid in getattr(global_config, "SUPER_USERS", [])}
-
-
-def _get_user_id(event: MessageEvent) -> str:
-    """从 nonebot2 事件获取 user_id"""
-    return str(event.user_id)
+@plugin.mount_init_method()
+async def init_recovery():
+    """插件初始化：恢复未到终态的视频任务轮询/审批。"""
+    recovered = await recover_unfinished_tasks()
+    if recovered:
+        logger.info(f"Agnes 视频插件启动恢复了 {recovered} 个未完成任务")
 
 
 # ---------------------------------------------------------------------------
@@ -72,8 +70,6 @@ async def agnes_video_prompt_inject(_ctx: AgentCtx):
     """
     if not _ctx.chat_key:
         return ""
-
-    from .service import _load_chat, _load_tasks
 
     chat_data = await _load_chat(_ctx.chat_key)
     global_tasks = await _load_tasks()
@@ -94,10 +90,9 @@ async def agnes_video_prompt_inject(_ctx: AgentCtx):
                 f"[Current Video Task]\n"
                 f"- TaskID: {task.task_id}\n"
                 f"- Prompt: {task.prompt}\n"
-                f"- Model: {task.model}\n"
-                f"- Size: {task.width}x{task.height}\n"
-                f"- Frames: {task.num_frames} @ {task.frame_rate}fps\n"
-                f"- Status: {task.status.value}\n"
+                f"- Model: {task.model} | Mode: {task.mode}\n"
+                f"- Duration: {task.seconds}s | Size: {task.size} | Ratio: {task.aspect_ratio}\n"
+                f"- Status: {task.status.value} (progress {task.progress}%)\n"
                 f"- Start: {start_time}\n"
                 f"- Elapsed: {elapsed}s\n"
             )
@@ -134,11 +129,14 @@ async def agnes_video_prompt_inject(_ctx: AgentCtx):
         f"[Agnes Video Generation Plugin]\n"
         f"Model: {model} | Approval: {'required' if require_approval else 'not required'} | State: {'idle' if is_idle else 'busy'}\n\n"
         f"## Available Functions:\n"
-        f"1. create_video(prompt, image_urls=[...], mode=..., reason=...) -> str\n"
-        f"   Create a video generation task. Returns task_id and status.\n"
+        f"1. create_video(prompt, mode=None, images=[...], first_frame=..., last_frame=..., "
+        f"audios=[...], videos=[...], seconds=\"5\", size=\"720P\", aspect_ratio=\"16:9\", reason=...) -> str\n"
+        f"   Create a video generation task (Agnes Video 2.5 API).\n"
         f"   - prompt: Video description (English works best, Chinese auto-translated)\n"
-        f"   - image_urls: Single ['url'] or multiple ['url1','url2'] for image-to-video\n"
-        f"   - mode: 'ti2vid' or 'keyframes' (optional)\n"
+        f"   - mode: 'text' | 'keyframe' | 'reference'; auto-derived if omitted\n"
+        f"   - first_frame/last_frame: keyframe mode (at least one)\n"
+        f"   - images/audios/videos: reference mode (at least one non-empty)\n"
+        f"   - seconds: \"4\"-\"12\"; size: 720P/1080P/1K/2K (flash model: 720P only)\n"
         f"   - reason: Why the user wants this video (optional, shown for approval)\n\n"
         f"2. get_video_by_task_id(task_id=...) -> str\n"
         f"   Get the video URL for a completed task.\n\n"
@@ -169,46 +167,50 @@ async def agnes_video_prompt_inject(_ctx: AgentCtx):
 @plugin.mount_sandbox_method(
     SandboxMethodType.BEHAVIOR,
     name="create_video",
-    description="创建视频任务。支持文生视频、图生视频、多图视频和关键帧动画。",
+    description="创建视频任务。支持文生视频、首尾帧关键帧动画和多模态参考生成（Agnes Video 2.5）。",
 )
 async def create_video(
     _ctx: AgentCtx,
     prompt: str,
     reason: str = "",
-    image_urls: Optional[List[str]] = None,
     mode: Optional[str] = None,
-    height: int = 768,
-    width: int = 1152,
-    num_frames: int = 121,
-    frame_rate: float = 24,
-    num_inference_steps: Optional[int] = None,
+    first_frame: Optional[str] = None,
+    last_frame: Optional[str] = None,
+    images: Optional[List[str]] = None,
+    audios: Optional[List[str]] = None,
+    videos: Optional[List[Dict[str, Any]]] = None,
+    seconds: str = "5",
+    size: str = "720P",
+    aspect_ratio: str = "16:9",
     seed: Optional[int] = None,
-    negative_prompt: Optional[str] = None,
     translate_prompt: bool = True,
 ) -> str:
-    """Create a video generation task.
+    """Create a video generation task (Agnes Video 2.5 series).
 
-    Creates a video generation task with Agnes AI. The task will be queued for processing.
-    If admin approval is required, the task will wait for approval before starting.
-    If not, the task will start immediately.
+    Creates a video generation task with Agnes AI. If admin approval is required,
+    the task waits for approval before submission; otherwise it starts immediately.
+    Generation and progress polling run as a framework background task; you will be
+    notified when the video completes or fails.
 
     Args:
         prompt: Video description. Include subject, action, scene, style, camera, lighting.
             English works best; Chinese will be auto-translated.
+            In reference mode you can refer to inputs with <Picture N>, <Audio N>, <Video N>.
             Example: "A cinematic shot of a cat walking on the beach at sunset"
         reason: Why the user wants this video. Shown during approval. Optional.
-        image_urls: Input images for image-to-video. Single: ['url']. Multiple: ['url1','url2'].
-            Supports HTTP(S) URL or Data URI (base64). Optional (omit for text-to-video).
-            Data URI example: ["data:image/png;base64,iVBORw0KGgo..."]
-        mode: Generation mode. 'ti2vid' (image-to-video) or 'keyframes' (keyframe animation).
-            Optional.
-        height: Video height. Default 768.
-        width: Video width. Default 1152.
-        num_frames: Frame count, must satisfy 8n+1 and <= 441. Default 121. Use 81 for quick test.
-        frame_rate: Frame rate 1-60. Default 24.
-        num_inference_steps: Inference steps. Optional (model default if not set).
+        mode: 'text' | 'keyframe' | 'reference'. Auto-derived when omitted:
+            first/last frame -> keyframe, images/audios/videos -> reference, else text.
+        first_frame: First frame image URL (keyframe mode). At least one of first/last.
+        last_frame: Last frame image URL (keyframe mode).
+        images: Reference image URLs (reference mode), max 8 (flash model: max 5).
+        audios: Reference audio URLs (reference mode), max 3, 2-12s each.
+        videos: Reference videos, list of {"url": ..., "start_seconds": ..., "require_audio": ...}.
+            Max 1, 2-12s. NOT supported by the flash model.
+        seconds: Video duration, string "4"-"12". Default "5".
+        size: Resolution tier: "720P" | "1080P" | "1K" | "2K". Default "720P".
+            The free agnes-video-2.5-flash model only supports "720P".
+        aspect_ratio: "16:9" (default), "9:16", "1:1", "4:3", "3:4", "21:9".
         seed: Random seed for reproducibility. Optional.
-        negative_prompt: Negative prompt. Optional.
         translate_prompt: Auto-translate non-English prompts. Default True.
 
     Returns:
@@ -219,14 +221,17 @@ async def create_video(
         Text-to-video:
         create_video(prompt="A cat walking on the beach at sunset")
 
-        Image-to-video:
-        create_video(prompt="Animate subtle camera movement",
-                     image_urls=["https://example.com/image.png"])
+        Keyframe animation (single image as first frame):
+        create_video(prompt="Animate subtle camera push-in",
+                     first_frame="https://example.com/image.png")
 
-        Keyframe animation:
-        create_video(prompt="Smooth transition between keyframes",
-                     image_urls=["https://a.png", "https://b.png"],
-                     mode="keyframes")
+        Keyframe transition between two frames:
+        create_video(prompt="Smooth cinematic transition",
+                     first_frame="https://a.png", last_frame="https://b.png")
+
+        Reference generation (image + audio):
+        create_video(prompt="<Picture 1> walks to the microphone and sings <Audio 1>...",
+                     images=["https://a.png"], audios=["https://b.mp3"])
 
         With approval reason:
         create_video(prompt="Funny cat video", reason="User wants a birthday gift")
@@ -235,12 +240,11 @@ async def create_video(
         return "无法创建视频任务：未获取到聊天会话信息。"
 
     # 检查进行中任务
-    from .service import _load_chat, _load_tasks
     chat_data = await _load_chat(_ctx.chat_key)
     if chat_data.current_task_id:
         gt = await _load_tasks()
         existing = gt.get_task(chat_data.current_task_id)
-        if existing and existing.status in (TaskStatus.QUEUED, TaskStatus.PENDING, TaskStatus.APPROVED, TaskStatus.PROCESSING):
+        if existing and existing.status in (TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.APPROVED, TaskStatus.PROCESSING):
             return (
                 f"当前已有正在进行的视频任务，请等待完成后再创建。\n"
                 f"任务ID: {existing.task_id}\n状态: {existing.status.value}\n"
@@ -248,34 +252,34 @@ async def create_video(
                 f"可使用 get_video_by_task_id(task_id=\"{existing.task_id}\") 查询进度。"
             )
 
-    try:
-        validate_video_args(num_frames, frame_rate, height, width)
-    except ValueError as e:
-        return f"参数错误: {e}"
+    resolved_mode = mode or derive_mode(first_frame, last_frame, images, audios, videos)
 
     try:
-        async with __import__("httpx").AsyncClient() as client:
-            prepared_prompt, _ = await prepare_generation_prompt(client, prompt, translate_prompt)
-
+        prepared_prompt = prompt
+        if translate_prompt:
+            async with httpx.AsyncClient() as client:
+                prepared_prompt, _ = await prepare_generation_prompt(client, prompt, True)
         task = await create_video_task(
-            task_id=f"task_{int(time.time() * 1000)}",
             prompt=prepared_prompt, ctx=_ctx,
             reason=reason or None, model=config.VIDEO_MODEL,
-            height=height, width=width, num_frames=num_frames, frame_rate=frame_rate,
-            nis=num_inference_steps, seed=seed,
-            neg=negative_prompt, imgs=image_urls, mode=mode,
+            mode=resolved_mode, seconds=seconds, size=size, aspect_ratio=aspect_ratio,
+            seed=seed, first_frame=first_frame, last_frame=last_frame,
+            images=images, audios=audios, videos=videos,
         )
-
-        approval_msg = " (需要管理员审批)" if config.REQUIRE_ADMIN_APPROVAL else ""
-        return (
-            f"视频任务已创建{approval_msg}\n"
-            f"任务ID: {task.task_id}\n状态: {task.status.value}\n"
-            f"提示词: {prepared_prompt}\n"
-            f"使用 get_video_by_task_id(task_id=\"{task.task_id}\") 查询进度。"
-        )
+    except ValueError as e:
+        return f"参数错误: {e}"
     except Exception as e:
         logger.exception(f"视频创建失败: {e}")
         return f"视频创建失败: {e}"
+
+    approval_msg = " (需要管理员审批)" if config.REQUIRE_ADMIN_APPROVAL else ""
+    return (
+        f"视频任务已创建{approval_msg}\n"
+        f"任务ID: {task.task_id}\n状态: {task.status.value}\n"
+        f"模式: {task.mode} | 时长: {task.seconds}s | 分辨率: {task.size} {task.aspect_ratio}\n"
+        f"提示词: {prepared_prompt}\n"
+        f"生成完成后会自动通知；可用 get_video_task_info(task_id=\"{task.task_id}\") 查询进度。"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -321,8 +325,8 @@ async def cancel_current_video_task(_ctx: AgentCtx) -> str:
 async def approve_video_task(_ctx: AgentCtx, task_id: str) -> str:
     """Approve a pending video generation task.
 
-    Transitions task from PENDING to APPROVED status and starts polling.
-    Accepts PENDING, QUEUED, or APPROVED states.
+    Marks the task APPROVED and resumes the background task (wakes it from the
+    approval wait, or restarts polling after a framework restart).
 
     Args:
         task_id: The task ID to approve.
@@ -331,7 +335,7 @@ async def approve_video_task(_ctx: AgentCtx, task_id: str) -> str:
         Text describing approval result.
 
     Examples:
-        approve_video_task(task_id="task_123456")
+        approve_video_task(task_id="task_000001")
     """
     success = await _approve_task(task_id)
     if success:
@@ -347,8 +351,6 @@ async def approve_video_task(_ctx: AgentCtx, task_id: str) -> str:
 async def reject_video_task(_ctx: AgentCtx, task_id: str) -> str:
     """Reject a pending video generation task.
 
-    Transitions task from PENDING to REJECTED status.
-
     Args:
         task_id: The task ID to reject.
 
@@ -356,7 +358,7 @@ async def reject_video_task(_ctx: AgentCtx, task_id: str) -> str:
         Text describing rejection result.
 
     Examples:
-        reject_video_task(task_id="task_123456")
+        reject_video_task(task_id="task_000001")
     """
     success = await _reject_task(task_id)
     if success:
@@ -365,7 +367,7 @@ async def reject_video_task(_ctx: AgentCtx, task_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 按 task_id 获取视频 URL (TOOL)
+# 查询 (TOOL)
 # ---------------------------------------------------------------------------
 
 
@@ -384,7 +386,7 @@ async def get_video_by_task_id(_ctx: AgentCtx, task_id: str) -> str:
         Video URL string, or error message if task not found or not completed.
 
     Examples:
-        get_video_by_task_id(task_id="task_123456")
+        get_video_by_task_id(task_id="task_000001")
     """
     task = await get_video_task(task_id)
     if not task:
@@ -394,108 +396,29 @@ async def get_video_by_task_id(_ctx: AgentCtx, task_id: str) -> str:
     return "\n".join(task.video_urls)
 
 
-# ---------------------------------------------------------------------------
-# 管理命令 (on_command)
-# ---------------------------------------------------------------------------
+@plugin.mount_sandbox_method(
+    SandboxMethodType.TOOL,
+    name="list_video_tasks",
+    description="分页列出所有视频生成任务。",
+)
+async def list_video_tasks(_ctx: AgentCtx, page: int = 1) -> str:
+    """List all video generation tasks with pagination.
 
+    Args:
+        page: Page number, starting from 1. Default 1.
 
-@on_command("agnes_y", aliases={"agnes-y"}, priority=5, block=True).handle()
-async def handle_approve(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Message = CommandArg()):
-    """批准视频生成任务"""
-    user_id = _get_user_id(event)
-    if user_id not in _get_super_users():
-        await matcher.finish()
-        return
+    Returns:
+        Task list text with task IDs, prompts and statuses.
 
-    cmd_content = str(arg).strip() if arg else ""
-    gt = await _load_tasks()
-    pending = [t for t in gt.get_all_tasks() if t.status == TaskStatus.PENDING]
-
-    if not cmd_content:
-        if not pending:
-            await matcher.finish(message="当前没有待审批的任务")
-            return
-        if len(pending) == 1:
-            task_id = pending[0].task_id
-        else:
-            ids = ", ".join(t.task_id for t in pending)
-            await matcher.finish(message=f"有多个待审批任务，请指定任务ID：{ids}")
-            return
-    else:
-        task_id = cmd_content
-
-    task = gt.get_task(task_id)
-    if not task:
-        await matcher.finish(message=f"任务 {task_id} 不存在")
-        return
-
-    success = await approve_video_task(task_id)
-    if success:
-        await matcher.finish(message=f"已批准任务 {task_id}，开始执行视频生成")
-    else:
-        await matcher.finish(message=f"批准任务 {task_id} 失败，请检查任务状态")
-
-
-@on_command("agnes_n", aliases={"agnes-n"}, priority=5, block=True).handle()
-async def handle_reject(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Message = CommandArg()):
-    """拒绝视频生成任务"""
-    user_id = _get_user_id(event)
-    if user_id not in _get_super_users():
-        await matcher.finish()
-        return
-
-    cmd_content = str(arg).strip() if arg else ""
-    gt = await _load_tasks()
-    pending = [t for t in gt.get_all_tasks() if t.status == TaskStatus.PENDING]
-
-    if not cmd_content:
-        if not pending:
-            await matcher.finish(message="当前没有待审批的任务")
-            return
-        if len(pending) == 1:
-            task_id = pending[0].task_id
-        else:
-            ids = ", ".join(t.task_id for t in pending)
-            await matcher.finish(message=f"有多个待审批任务，请指定任务ID：{ids}")
-            return
-    else:
-        task_id = cmd_content
-
-    task = gt.get_task(task_id)
-    if not task:
-        await matcher.finish(message=f"任务 {task_id} 不存在")
-        return
-
-    success = await reject_video_task(task_id)
-    if success:
-        await matcher.finish(message=f"已拒绝任务 {task_id}")
-    else:
-        await matcher.finish(message=f"拒绝任务 {task_id} 失败，请检查任务状态")
-
-
-@on_command("agnes_list", aliases={"agnes-list", "agnes-ls", "agnes_ls"}, priority=5, block=True).handle()
-async def handle_list(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Message = CommandArg()):
-    """查询视频任务列表"""
-    user_id = _get_user_id(event)
-    if user_id not in _get_super_users():
-        await matcher.finish()
-        return
-
-    try:
+    Examples:
+        list_video_tasks()
+        list_video_tasks(page=2)
+    """
+    if page < 1:
         page = 1
-        if arg:
-            page = int(str(arg).strip())
-            if page < 1:
-                page = 1
-    except ValueError:
-        await matcher.finish(message="页码必须是一个正整数")
-        return
-
     tasks_page, total_pages, total_tasks = await get_tasks_page(page)
     if not tasks_page:
-        await matcher.finish(message="没有找到任何任务")
-        return
-
+        return "没有找到任何任务"
     info = f"任务列表 (第 {page}/{total_pages} 页，共 {total_tasks} 个任务):\n\n"
     for i, task in enumerate(tasks_page, 1):
         t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task.create_time))
@@ -506,43 +429,164 @@ async def handle_list(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Mess
             f"   创建时间: {t}\n\n"
         )
     if page < total_pages:
-        info += f"使用 /agnes-list {page + 1} 查看下一页"
+        info += f"使用 list_video_tasks(page={page + 1}) 查看下一页"
+    return info
 
-    await matcher.finish(message=info)
 
+@plugin.mount_sandbox_method(
+    SandboxMethodType.TOOL,
+    name="get_video_task_info",
+    description="查询指定视频任务的详细信息。",
+)
+async def get_video_task_info(_ctx: AgentCtx, task_id: str) -> str:
+    """Get detailed info of a specific video task.
 
-@on_command("agnes_info", aliases={"agnes-info", "agnes-i", "agnes_i"}, priority=5, block=True).handle()
-async def handle_info(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Message = CommandArg()):
-    """查询任务详情"""
-    user_id = _get_user_id(event)
-    if user_id not in _get_super_users():
-        await matcher.finish()
-        return
+    Args:
+        task_id: The task ID to query.
 
-    cmd_content = str(arg).strip() if arg else ""
-    if not cmd_content:
-        await matcher.finish(message="请指定要查询的任务ID")
-        return
+    Returns:
+        Task detail text, or error message if not found.
 
-    task = await get_video_task(cmd_content)
+    Examples:
+        get_video_task_info(task_id="task_000001")
+    """
+    task = await get_video_task(task_id)
     if not task:
-        await matcher.finish(message=f"任务 {cmd_content} 不存在")
-        return
-
-    await matcher.finish(message=f"任务详情:\n\n{format_task_info(task)}")
+        return f"任务 {task_id} 不存在。"
+    return format_task_info(task)
 
 
-@on_command("agnes_help", aliases={"agnes-h", "agnes_h"}, priority=5, block=True).handle()
-async def handle_help(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Message = CommandArg()):
-    """显示插件使用帮助"""
-    user_id = _get_user_id(event)
-    if user_id not in _get_super_users():
-        await matcher.finish()
-        return
+# ---------------------------------------------------------------------------
+# 管理命令 (框架命令系统)
+# ---------------------------------------------------------------------------
 
+
+async def _resolve_single_pending(task_id: str, label: str) -> tuple[Optional[str], Optional[str]]:
+    """命令参数解析：显式 task_id 或唯一 PENDING 任务自动选择。
+
+    Returns: (task_id, error_message)
+    """
+    if task_id:
+        gt = await _load_tasks()
+        if not gt.get_task(task_id):
+            return None, f"任务 {task_id} 不存在"
+        return task_id, None
+    gt = await _load_tasks()
+    pending = [t for t in gt.get_all_tasks() if t.status == TaskStatus.PENDING]
+    if not pending:
+        return None, f"当前没有待{label}的任务"
+    if len(pending) > 1:
+        ids = ", ".join(t.task_id for t in pending)
+        return None, f"有多个待{label}任务，请指定任务ID：{ids}"
+    return pending[0].task_id, None
+
+
+@plugin.mount_command(
+    name="agnes_y",
+    description="批准视频生成任务",
+    aliases=["agnes-y", "agnes-yes"],
+    permission=CommandPermission.SUPER_USER,
+    usage="agnes_y [task_id]；留空时自动选择唯一的待审批任务",
+    category="Agnes 视频",
+    tags=["video", "agnes", "approval"],
+)
+async def cmd_approve(
+    context: CommandExecutionContext,
+    task_id: Annotated[str, Arg("要批准的任务ID，留空自动选择", positional=True)] = "",
+) -> CommandResponse:
+    tid, err = await _resolve_single_pending(task_id, "审批")
+    if err:
+        return CmdCtl.failed(err)
+    if await _approve_task(tid):
+        return CmdCtl.success(f"已批准任务 {tid}，开始执行视频生成")
+    return CmdCtl.failed(f"批准任务 {tid} 失败，请检查任务状态")
+
+
+@plugin.mount_command(
+    name="agnes_n",
+    description="拒绝视频生成任务",
+    aliases=["agnes-no"],
+    permission=CommandPermission.SUPER_USER,
+    usage="agnes_n [task_id]；留空时自动选择唯一的待审批任务",
+    category="Agnes 视频",
+    tags=["video", "agnes", "approval"],
+)
+async def cmd_reject(
+    context: CommandExecutionContext,
+    task_id: Annotated[str, Arg("要拒绝的任务ID，留空自动选择", positional=True)] = "",
+) -> CommandResponse:
+    tid, err = await _resolve_single_pending(task_id, "审批")
+    if err:
+        return CmdCtl.failed(err)
+    if await _reject_task(tid):
+        return CmdCtl.success(f"已拒绝任务 {tid}")
+    return CmdCtl.failed(f"拒绝任务 {tid} 失败，请检查任务状态")
+
+
+@plugin.mount_command(
+    name="agnes_list",
+    description="分页查询视频任务列表",
+    aliases=["agnes-ls"],
+    permission=CommandPermission.SUPER_USER,
+    usage="agnes_list [page]",
+    category="Agnes 视频",
+    tags=["video", "agnes"],
+)
+async def cmd_list(
+    context: CommandExecutionContext,
+    page: Annotated[int, Arg("页码", positional=True)] = 1,
+) -> CommandResponse:
+    if page < 1:
+        page = 1
+    tasks_page, total_pages, total_tasks = await get_tasks_page(page)
+    if not tasks_page:
+        return CmdCtl.failed("没有找到任何任务")
+    info = f"任务列表 (第 {page}/{total_pages} 页，共 {total_tasks} 个任务):\n\n"
+    for i, task in enumerate(tasks_page, 1):
+        t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task.create_time))
+        info += (
+            f"{i}. 任务ID: {task.task_id}\n"
+            f"   提示词: {task.prompt}\n"
+            f"   状态: {task.status.value}\n"
+            f"   创建时间: {t}\n\n"
+        )
+    if page < total_pages:
+        info += f"使用 /agnes_list {page + 1} 查看下一页"
+    return CmdCtl.success(info)
+
+
+@plugin.mount_command(
+    name="agnes_info",
+    description="查询视频任务详情",
+    aliases=["agnes-i"],
+    permission=CommandPermission.SUPER_USER,
+    usage="agnes_info <task_id>",
+    category="Agnes 视频",
+    tags=["video", "agnes"],
+)
+async def cmd_info(
+    context: CommandExecutionContext,
+    task_id: Annotated[str, Arg("要查询的任务ID", positional=True, greedy=True)],
+) -> CommandResponse:
+    task = await get_video_task(task_id)
+    if not task:
+        return CmdCtl.failed(f"任务 {task_id} 不存在")
+    return CmdCtl.success(f"任务详情:\n\n{format_task_info(task)}")
+
+
+@plugin.mount_command(
+    name="agnes_help",
+    description="显示 Agnes 插件使用帮助",
+    aliases=["agnes-h"],
+    permission=CommandPermission.SUPER_USER,
+    usage="agnes_help",
+    category="Agnes 视频",
+    tags=["video", "agnes", "help"],
+)
+async def cmd_help(context: CommandExecutionContext) -> CommandResponse:
     approval_status = "开启" if config.REQUIRE_ADMIN_APPROVAL else "关闭"
     help_text = (
-        f"🎬 Agnes AI 视频生成插件 v1.1.0\n\n"
+        f"🎬 Agnes AI 视频生成插件 v2.0.0\n\n"
         f"📋 管理员命令 (需要 SUPER_USERS 权限):\n"
         f"  /agnes_y [task_id] — 批准视频任务\n"
         f"  /agnes_n [task_id] — 拒绝视频任务\n"
@@ -551,20 +595,20 @@ async def handle_help(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Mess
         f"  /agnes_help — 显示此帮助\n\n"
         f"⚙️ 当前配置:\n"
         f"  审批流程: {approval_status}\n"
+        f"  文本模型: {config.TEXT_MODEL}\n"
+        f"  图片模型: {config.IMAGE_MODEL}\n"
         f"  视频模型: {config.VIDEO_MODEL}\n"
         f"  轮询间隔: {config.POLL_INTERVAL}s\n"
         f"  最大轮询: {config.MAX_POLL_ATTEMPTS}次\n\n"
         f"💡 Agent 调用 (对话中直接使用):\n"
-        f"  create_video(prompt, ...) — 创建视频\n"
+        f"  create_video(prompt, mode, images/first_frame/..., seconds, size) — 创建视频\n"
         f"  get_video_by_task_id(task_id) — 获取视频 URL\n"
         f"  cancel_current_video_task() — 取消任务\n"
-        f"  approve_video_task(task_id) — 批准任务\n"
-        f"  reject_video_task(task_id) — 拒绝任务\n"
+        f"  approve_video_task(task_id) / reject_video_task(task_id) — 审批\n"
         f"  list_video_tasks(page) — 任务列表\n"
-        f"  get_video_task_info(task_id) — 任务详情\n\n"
-        f"⚠️ 如果命令无响应，请将 QQ 号添加到 nekro-agent 配置的 SUPER_USERS 列表中。"
+        f"  get_video_task_info(task_id) — 任务详情"
     )
-    await matcher.finish(message=help_text)
+    return CmdCtl.success(help_text)
 
 
 # ---------------------------------------------------------------------------

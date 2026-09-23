@@ -1,9 +1,12 @@
-"""业务逻辑：任务管理、API 调用、异步视频处理
+"""业务逻辑：任务管理、API 调用、异步视频处理（框架任务系统驱动）
 
 状态流转:
   创建 → PENDING (需审批) / QUEUED (不需审批)
-  PENDING → APPROVED (审批通过) / REJECTED (审批拒绝)
-  APPROVED/QUEUED → PROCESSING (API 开始生成) → COMPLETED / FAILED
+  PENDING → APPROVED (审批通过) / REJECTED (审批拒绝/超时)
+  APPROVED/QUEUED → PROCESSING (API 生成中) → COMPLETED / FAILED
+
+视频轮询由框架异步任务系统 (mount_async_task + TaskRunner) 承载，
+插件重启后由 mount_init_method 恢复未到终态的任务。
 """
 
 import asyncio
@@ -12,25 +15,57 @@ import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import httpx
-from nekro_agent.api import message
 from nekro_agent.api.core import logger
+from nekro_agent.api.message import push_system
 from nekro_agent.api.schemas import AgentCtx
-from nekro_agent.services.message_service import message_service
+from nekro_agent.services.plugin.task import AsyncTaskHandle, TaskCtl, task as task_api
 
-from .conf import config, store
+from .conf import config, plugin, store
 from .models import ChatSessionData, GlobalTaskData, TaskStatus, VideoTask
 
-SIZE_RE = re.compile(r"^[1-9]\d*x[1-9]\d*$")
+IMAGE_SIZE_TIERS = {"1K", "2K", "3K", "4K"}
+VIDEO_SIZE_TIERS = {"720P", "1080P", "1K", "2K"}
+RATIO_SET = {"1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9"}
+# 视频比例是图片比例的子集：2:3 / 3:2 会被 API 拒绝
+VIDEO_RATIO_SET = {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"}
+VIDEO_MODES = {"text", "keyframe", "reference"}
 _ENV_NAMES = ("AGNES_API_KEY", "AGNES_API_TOKEN", "APIHUB_AGNES_API_KEY")
 _STORE_TASKS = "agnes_video_tasks"
 _STORE_CHAT = "agnes_chat"
+_TASK_TYPE = "agnes_video"
 _TR_SYS = (
     "Translate the user's image/video generation prompt into fluent English. "
     "Preserve all concrete visual details, style words, camera motion, lighting, "
     "composition constraints, and negative instructions. Return only the English prompt."
 )
+
+
+# ---------------------------------------------------------------------------
+# 旧配置兼容：已废弃/下线模型归一
+# ---------------------------------------------------------------------------
+
+
+def _normalize_video_model(model: str) -> str:
+    """agnes-video-v2.0 已于 2026-09-25 下线，自动归一到 2.5-flash（免费）。"""
+    if not model or model.startswith("agnes-video-v2.0"):
+        logger.warning(f"视频模型 {model!r} 已下线，自动改用 agnes-video-2.5-flash")
+        return "agnes-video-2.5-flash"
+    return model
+
+
+def _normalize_text_model(model: str) -> str:
+    """agnes-2.0-flash 已废弃，归一到 agnes-2.5-flash。"""
+    if not model or model == "agnes-2.0-flash":
+        return "agnes-2.5-flash"
+    return model
+
+
+def _is_video_flash(model: str) -> bool:
+    return model.endswith("2.5-flash")
+
 
 # ---------------------------------------------------------------------------
 # 存储
@@ -83,6 +118,7 @@ async def _req(client: httpx.AsyncClient, method: str, path: str, payload: Optio
     base = _get_base_url()
     url = f"{base}/{path.strip().lstrip('/')}"
     logger.debug(f"API 请求: {method} {url}")
+    r = None
     try:
         r = await (client.get(url, headers=_hdrs(), timeout=config.TIMEOUT) if method == "GET"
                    else client.post(url, json=payload, headers=_hdrs(), timeout=config.TIMEOUT))
@@ -115,7 +151,7 @@ def _needs_en(prompt: str) -> bool:
 
 async def _translate(client: httpx.AsyncClient, prompt: str) -> str:
     data = await _req(client, "POST", "/v1/chat/completions", {
-        "model": config.TEXT_MODEL,
+        "model": _normalize_text_model(config.TEXT_MODEL),
         "messages": [{"role": "system", "content": _TR_SYS}, {"role": "user", "content": prompt}],
         "temperature": 0, "max_tokens": 800,
     })
@@ -154,11 +190,15 @@ def extract_image_urls(data: Dict[str, Any]) -> List[str]:
 
 
 def extract_video_urls(data: Dict[str, Any]) -> List[str]:
+    """提取视频 URL。2.5 系列完成后在顶层 `url`，兼容 `video_url` 与 data 数组。"""
     urls: List[str] = []
-    for k in ("video_url", "url", "remixed_from_video_id"):
+    for k in ("url", "video_url"):
         v = data.get(k)
         if isinstance(v, str) and v.startswith(("http://", "https://")):
             urls.append(v)
+    meta = data.get("metadata")
+    if isinstance(meta, dict):
+        urls.extend(extract_video_urls(meta))
     for item in data.get("data", []):
         if isinstance(item, dict):
             urls.extend(extract_video_urls(item))
@@ -171,73 +211,168 @@ def extract_video_urls(data: Dict[str, Any]) -> List[str]:
 
 
 def validate_size(value: Optional[str]) -> None:
-    if value and not SIZE_RE.match(value):
-        raise ValueError(f"无效尺寸: {value}。期望 WIDTHxHEIGHT，例如 1024x768。")
+    """图片尺寸：兼容档位制 (1K/2K/3K/4K) 与历史精确尺寸写法。"""
+    if not value:
+        return
+    if value.upper() in IMAGE_SIZE_TIERS:
+        return
+    if re.match(r"^[1-9]\d*x[1-9]\d*$", value):
+        return
+    raise ValueError(f"无效尺寸: {value}。期望档位 1K/2K/3K/4K 或 WIDTHxHEIGHT（如 1024x768）。")
 
 
-def validate_video_args(nf: Optional[int], fr: Optional[float], h: Optional[int], w: Optional[int]) -> None:
-    if nf is not None and (nf > 441 or (nf - 1) % 8 != 0):
-        raise ValueError("无效 num_frames: 必须 <= 441 且满足 8n+1，例如 81 或 121。")
-    if fr is not None and not (1 <= fr <= 60):
-        raise ValueError("无效 frame_rate: 范围 1-60。")
-    for name, val in [("height", h), ("width", w)]:
-        if val is not None and val <= 0:
-            raise ValueError(f"无效 {name}: 必须为正整数。")
+def validate_ratio(value: Optional[str]) -> None:
+    if value and value not in RATIO_SET:
+        raise ValueError(f"无效宽高比: {value}。支持: {', '.join(sorted(RATIO_SET))}")
+
+
+def derive_mode(
+    first_frame: Optional[str] = None,
+    last_frame: Optional[str] = None,
+    images: Optional[List[str]] = None,
+    audios: Optional[List[str]] = None,
+    videos: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    if first_frame or last_frame:
+        return "keyframe"
+    if images or audios or videos:
+        return "reference"
+    return "text"
+
+
+def validate_video_args(
+    mode: str,
+    seconds: str,
+    size: str,
+    model: str,
+    first_frame: Optional[str] = None,
+    last_frame: Optional[str] = None,
+    images: Optional[List[str]] = None,
+    audios: Optional[List[str]] = None,
+    videos: Optional[List[Dict[str, Any]]] = None,
+    aspect_ratio: str = "16:9",
+) -> None:
+    """按 Agnes Video 2.5 系列规则校验参数。"""
+    if mode not in VIDEO_MODES:
+        raise ValueError(f"无效 mode: {mode}。支持 text/keyframe/reference。")
+    if aspect_ratio not in VIDEO_RATIO_SET:
+        raise ValueError(f"无效 aspect_ratio: {aspect_ratio}。视频支持: {', '.join(sorted(VIDEO_RATIO_SET))}。")
+    try:
+        secs = int(seconds)
+    except (TypeError, ValueError):
+        raise ValueError(f"无效 seconds: {seconds}。必须是 4-12 的整数字符串，例如 \"5\"。")
+    if not 4 <= secs <= 12:
+        raise ValueError(f"无效 seconds: {seconds}。支持 4-12 秒。")
+    if size not in VIDEO_SIZE_TIERS:
+        raise ValueError(f"无效 size: {size}。支持 {', '.join(sorted(VIDEO_SIZE_TIERS))}。")
+    if images and len(images) > 8:
+        raise ValueError("参考图片最多 8 张。")
+    if audios and len(audios) > 3:
+        raise ValueError("参考音频最多 3 段。")
+    if videos and len(videos) > 1:
+        raise ValueError("参考视频最多 1 个。")
+    if _is_video_flash(model):
+        if size != "720P":
+            raise ValueError("agnes-video-2.5-flash 仅支持 size=\"720P\"。")
+        if images and len(images) > 5:
+            raise ValueError("agnes-video-2.5-flash 参考图片最多 5 张。")
+        if videos:
+            raise ValueError("agnes-video-2.5-flash 不支持参考视频输入。")
+    media_count = sum(bool(x) for x in (first_frame, last_frame)) + len(images or []) + len(audios or []) + len(videos or [])
+    if mode == "text" and media_count:
+        raise ValueError("text 模式不接受任何媒体输入（first_frame/last_frame/images/audios/videos）。")
+    if mode == "keyframe" and not (first_frame or last_frame):
+        raise ValueError("keyframe 模式需要 first_frame 或 last_frame 至少一个。")
+    if mode == "reference" and not (images or audios or videos):
+        raise ValueError("reference 模式需要 images/audios/videos 至少一类非空。")
+    if mode == "keyframe" and (images or audios or videos):
+        raise ValueError("keyframe 模式不允许 images/audios/videos。")
+    if mode == "reference" and (first_frame or last_frame):
+        raise ValueError("reference 模式不允许 first_frame/last_frame。")
+    if media_count > 12:
+        raise ValueError("单次请求媒体文件总数不得超过 12 个。")
 
 
 # ---------------------------------------------------------------------------
-# 视频任务 — 创建
+# Payload 构建
 # ---------------------------------------------------------------------------
 
 
-def _build_payload(
-    prompt: str, model: str, height: int, width: int, num_frames: int, frame_rate: float,
-    nis: Optional[int] = None, seed: Optional[int] = None, neg: Optional[str] = None,
-    img: Optional[str] = None, imgs: Optional[List[str]] = None, mode: Optional[str] = None,
+def build_video_payload(
+    prompt: str,
+    model: str,
+    mode: str,
+    seconds: str,
+    size: str,
+    aspect_ratio: str,
+    seed: Optional[int] = None,
+    first_frame: Optional[str] = None,
+    last_frame: Optional[str] = None,
+    images: Optional[List[str]] = None,
+    audios: Optional[List[str]] = None,
+    videos: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    """构建 POST /v1/videos 请求体（Agnes Video 2.5 系列）。"""
     p: Dict[str, Any] = {
-        "model": model, "prompt": prompt, "height": height, "width": width,
-        "num_frames": num_frames, "frame_rate": frame_rate,
+        "model": model, "prompt": prompt, "mode": mode,
+        "seconds": str(seconds), "size": size, "aspect_ratio": aspect_ratio,
     }
-    if nis is not None:
-        p["num_inference_steps"] = nis
     if seed is not None:
         p["seed"] = seed
-    if neg:
-        p["negative_prompt"] = neg
-    if imgs and len(imgs) >= 2:
-        p["extra_body"] = {"image": imgs, **({"mode": mode} if mode else {})}
-    elif img:
-        if mode:
-            p["extra_body"] = {"image": img, "mode": mode}
-        else:
-            p["image"] = img
+    if mode == "keyframe":
+        if first_frame:
+            p["first_frame"] = first_frame
+        if last_frame:
+            p["last_frame"] = last_frame
+    elif mode == "reference":
+        if images:
+            p["images"] = images
+        if audios:
+            p["audios"] = audios
+        if videos:
+            p["videos"] = videos
     return p
 
 
+def _poll_path(video_id: str, model: str) -> str:
+    return f"/agnesapi?video_id={quote(video_id)}&model_name={quote(model)}"
+
+
+# ---------------------------------------------------------------------------
+# 视频任务 — 创建 / 审批 / 取消
+# ---------------------------------------------------------------------------
+
+
 async def create_video_task(
-    task_id: str, prompt: str, ctx: AgentCtx,
+    prompt: str, ctx: AgentCtx,
     reason: Optional[str] = None, model: str = "",
-    height: int = 768, width: int = 1152, num_frames: int = 121, frame_rate: float = 24,
-    nis: Optional[int] = None, seed: Optional[int] = None, neg: Optional[str] = None,
-    img: Optional[str] = None, imgs: Optional[List[str]] = None, mode: Optional[str] = None,
+    mode: str = "text", seconds: str = "5", size: str = "720P", aspect_ratio: str = "16:9",
+    seed: Optional[int] = None,
+    first_frame: Optional[str] = None, last_frame: Optional[str] = None,
+    images: Optional[List[str]] = None, audios: Optional[List[str]] = None,
+    videos: Optional[List[Dict[str, Any]]] = None,
 ) -> VideoTask:
-    """创建视频任务并提交到 Agnes API。"""
-    gt = await _load_tasks()
+    """创建视频任务并挂到框架异步任务系统。
+
+    API 提交与轮询都在任务协程内完成，本函数只负责落库和启动。
+    """
     if not ctx.from_chat_key:
         raise ValueError("from_chat_key is required")
-
-    payload = _build_payload(prompt, model, height, width, num_frames, frame_rate, nis, seed, neg, img, imgs, mode)
-
-    # 初始状态: 需审批 → PENDING, 不需审批 → QUEUED
-    initial_status = TaskStatus.PENDING if config.REQUIRE_ADMIN_APPROVAL else TaskStatus.QUEUED
-
-    task = VideoTask.create(
-        task_id=task_id, chat_key=ctx.from_chat_key, prompt=prompt,
-        reason=reason, model=model, height=height, width=width,
-        num_frames=num_frames, frame_rate=frame_rate, image_url=img, image_urls=imgs, mode=mode,
+    model = _normalize_video_model(model or config.VIDEO_MODEL)
+    validate_video_args(
+        mode, seconds, size, model, first_frame, last_frame, images, audios, videos,
+        aspect_ratio=aspect_ratio,
     )
-    task.status = initial_status
+
+    gt = await _load_tasks()
+    task = VideoTask.create(
+        task_id=gt.get_next_task_id(), chat_key=ctx.from_chat_key, prompt=prompt,
+        reason=reason, model=model, mode=mode, seconds=seconds, size=size,
+        aspect_ratio=aspect_ratio, seed=seed,
+        first_frame=first_frame, last_frame=last_frame,
+        image_urls=images, audio_urls=audios, video_refs=videos,
+    )
+    task.status = TaskStatus.PENDING if config.REQUIRE_ADMIN_APPROVAL else TaskStatus.QUEUED
 
     gt.add_task(task)
     await _save_tasks(gt)
@@ -246,148 +381,30 @@ async def create_video_task(
     chat_data.current_task_id = task.task_id
     await _save_chat(ctx.from_chat_key, chat_data)
 
-    # 需审批时不调用 API，等待审批通过后再创建
-    if config.REQUIRE_ADMIN_APPROVAL:
-        manager_msg = (
-            f"【视频生成申请】\n任务ID: {task.task_id}\n会话: {ctx.from_chat_key}\n"
-            f"提示词: {prompt}\n模型: {model}\n尺寸: {width}x{height}\n"
-            f"帧数: {num_frames}\n帧率: {frame_rate}\n"
-        )
-        if reason:
-            manager_msg += f"原因: {reason}\n"
-        manager_msg += (
-            f"使用 approve_video_task(task_id=\"{task.task_id}\") 批准\n"
-            f"使用 reject_video_task(task_id=\"{task.task_id}\") 拒绝"
-        )
-        try:
-            target = config.MANAGER_CHAT_KEY or ctx.from_chat_key
-            await message.send_text(chat_key=target, message=manager_msg, ctx=ctx, record=False)
-        except Exception as e:
-            logger.error(f"发送审批消息失败: {e}")
-        return task
-
-    # 不需审批：立即调用 API 创建任务
-    try:
-        async with httpx.AsyncClient() as client:
-            created = await _req(client, "POST", "/v1/videos", payload)
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"创建视频任务 API 调用失败: {error_msg}")
-        await update_task_status(task.task_id, TaskStatus.FAILED, error_message=error_msg)
-        chat_data = await _load_chat(ctx.from_chat_key)
-        if chat_data.current_task_id == task.task_id:
-            chat_data.current_task_id = None
-            await _save_chat(ctx.from_chat_key, chat_data)
-        raise
-
-    api_id = created.get("id")
-    api_video_id = created.get("video_id") or created.get("videoId")
-    api_st = str(created.get("status", "")) if created.get("status") is not None else None
-
-    logger.info(f"创建任务响应: id={api_id}, video_id={api_video_id}, status={api_st}")
-
-    # 用 API 返回的 id 更新 task_id（可能和本地生成的不同）
-    if api_id and api_id != task.task_id:
-        gt = await _load_tasks()
-        gt.tasks.pop(task.task_id, None)
-        task.task_id = api_id
-        gt.add_task(task)
-        await _save_tasks(gt)
-        chat_data = await _load_chat(ctx.from_chat_key)
-        if chat_data.current_task_id == task_id:
-            chat_data.current_task_id = api_id
-            await _save_chat(ctx.from_chat_key, chat_data)
-
-    if api_video_id:
-        task.video_id = api_video_id
-    if api_st:
-        task.status = TaskStatus.from_api(api_st)
-
-    # 同步更新 store
-    gt = await _load_tasks()
-    gt.update_task(task.task_id, status=task.status, video_id=task.video_id)
-    await _save_tasks(gt)
-
-    # 开始轮询
-    asyncio.create_task(process_video_task(task.task_id))
-
+    await task_api.start(_TASK_TYPE, task.task_id, task.chat_key, plugin, task.task_id)
     return task
 
 
-# ---------------------------------------------------------------------------
-# 视频任务 — 审批
-# ---------------------------------------------------------------------------
-
-
-_APPROVABLE_STATUSES = {TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.APPROVED}
-
-
 async def approve_video_task(task_id: str) -> bool:
-    """批准视频任务: PENDING → APPROVED → 调用 API → 开始轮询
+    """批准视频任务。
 
-    接受多种状态:
-    - PENDING: 需审批模式下的初始状态（未调用 API）
-    - QUEUED: 已调用 API 但未开始轮询
-    - APPROVED: 已经批准但轮询可能已停止（重启后恢复）
+    - 有活着的任务协程在等审批: 标记 APPROVED 并 notify 唤醒
+    - 协程不存在（重启后）: 标记 APPROVED 并重新挂载任务协程
     """
     gt = await _load_tasks()
     task = gt.get_task(task_id)
-    if not task or task.status not in _APPROVABLE_STATUSES:
+    if not task or task.status not in (TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.APPROVED):
         logger.warning(f"批准失败: {task_id} 不存在或状态不可审批: {task.status if task else 'N/A'}")
         return False
 
-    # 如果还没有调用 API（PENDING 状态），先调用 API 创建任务
-    if task.status == TaskStatus.PENDING and not task.video_id:
-        logger.info(f"审批通过，调用 API 创建任务 {task_id}")
-        payload = _build_payload(
-            task.prompt, task.model, task.height, task.width,
-            task.num_frames, task.frame_rate,
-            None, None, None,  # nis, seed, neg — stored in task if needed
-            task.image_url, task.image_urls, task.mode,
-        )
-        try:
-            async with httpx.AsyncClient() as client:
-                created = await _req(client, "POST", "/v1/videos", payload)
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"审批后 API 调用失败: {error_msg}")
-            await update_task_status(task_id, TaskStatus.FAILED, error_message=error_msg)
-            return False
-
-        api_id = created.get("id")
-        api_video_id = created.get("video_id") or created.get("videoId")
-        api_st = str(created.get("status", "")) if created.get("status") is not None else None
-
-        # 用 API 返回的 id 更新 task_id
-        if api_id and api_id != task_id:
-            gt = await _load_tasks()
-            gt.tasks.pop(task_id, None)
-            task.task_id = api_id
-            gt.add_task(task)
-            await _save_tasks(gt)
-            # 更新会话中的 task_id
-            chat_data = await _load_chat(task.chat_key)
-            if chat_data.current_task_id == task_id:
-                chat_data.current_task_id = api_id
-                await _save_chat(task.chat_key, chat_data)
-            task_id = api_id
-
-        if api_video_id:
-            task.video_id = api_video_id
-        task.status = TaskStatus.APPROVED
-        if api_st:
-            task.status = TaskStatus.from_api(api_st)
-
-        # 同步到 store
-        gt = await _load_tasks()
-        gt.update_task(task_id, status=task.status, video_id=task.video_id)
-        await _save_tasks(gt)
-
-    elif task.status != TaskStatus.APPROVED:
-        # QUEUED 状态，直接标记为 APPROVED
+    if task.status == TaskStatus.PENDING:
         await update_task_status(task_id, TaskStatus.APPROVED)
 
-    asyncio.create_task(process_video_task(task_id))
+    handle = task_api.get_handle(_TASK_TYPE, task_id)
+    if handle and handle.notify("approval", True):
+        return True
+    if not task_api.is_running(_TASK_TYPE, task_id):
+        await task_api.start(_TASK_TYPE, task_id, task.chat_key, plugin, task_id)
     return True
 
 
@@ -399,159 +416,10 @@ async def reject_video_task(task_id: str) -> bool:
         logger.warning(f"拒绝失败: {task_id} 不存在或状态不可拒绝 (当前: {task.status if task else 'N/A'})")
         return False
     await update_task_status(task_id, TaskStatus.REJECTED, error_message="管理员拒绝了请求")
+    handle = task_api.get_handle(_TASK_TYPE, task_id)
+    if handle:
+        handle.notify("approval", False)
     return True
-
-
-# ---------------------------------------------------------------------------
-# 视频任务 — 状态更新 + 通知
-# ---------------------------------------------------------------------------
-
-
-def _is_terminal_status(status: TaskStatus) -> bool:
-    """是否为终态（不再轮询）"""
-    return status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.REJECTED)
-
-
-async def update_task_status(task_id: str, status: TaskStatus, **kwargs) -> None:
-    """更新任务状态，终态时清理会话并通知。不允许从终态转移到其他状态。"""
-    gt = await _load_tasks()
-    existing = gt.get_task(task_id)
-    if not existing:
-        return
-    # 终态不可覆盖（防止取消后被轮询覆盖）
-    if _is_terminal_status(existing.status) and not _is_terminal_status(status):
-        logger.warning(f"任务 {task_id} 已是终态 {existing.status.value}，不允许更新为 {status.value}")
-        return
-    if not gt.update_task(task_id, status=status, **kwargs):
-        return
-    await _save_tasks(gt)
-
-    task = gt.get_task(task_id)
-    if not task:
-        return
-
-    # 终态处理
-    if _is_terminal_status(status):
-        # 清理会话中的 current_task_id
-        chat_data = await _load_chat(task.chat_key)
-        if chat_data.current_task_id == task_id:
-            chat_data.current_task_id = None
-            await _save_chat(task.chat_key, chat_data)
-
-    # 完成通知
-    if status == TaskStatus.COMPLETED and task.video_urls:
-        chat_data = await _load_chat(task.chat_key)
-        chat_data.add_history(task.prompt, task.video_urls, task.task_id)
-        await _save_chat(task.chat_key, chat_data)
-
-        msg = (
-            f"【视频生成完成】\n任务ID: {task_id}\n提示词: {task.prompt}\n"
-            f"视频已生成完毕!\n视频URL:\n" + "\n".join(task.video_urls) +
-            "\n(use `send_msg_file` to send the video)"
-        )
-        try:
-            await message_service.push_system_message(chat_key=task.chat_key, agent_messages=msg, trigger_agent=True)
-        except Exception as e:
-            logger.error(f"发送完成通知失败: {e}")
-
-    # 失败/拒绝通知
-    elif status == TaskStatus.FAILED:
-        err = task.error_message or "未知错误"
-        msg = f"【视频生成失败】\n任务ID: {task_id}\n提示词: {task.prompt}\n错误信息: {err}"
-        try:
-            await message_service.push_system_message(chat_key=task.chat_key, agent_messages=msg, trigger_agent=True)
-        except Exception as e:
-            logger.error(f"发送失败通知失败: {e}")
-
-    elif status == TaskStatus.REJECTED:
-        msg = f"【视频生成已拒绝】\n任务ID: {task_id}\n提示词: {task.prompt}\n管理员拒绝了请求。"
-        try:
-            await message_service.push_system_message(chat_key=task.chat_key, agent_messages=msg, trigger_agent=True)
-        except Exception as e:
-            logger.error(f"发送拒绝通知失败: {e}")
-
-
-# ---------------------------------------------------------------------------
-# 视频任务 — 后台轮询
-# ---------------------------------------------------------------------------
-
-
-async def process_video_task(task_id: str) -> None:
-    """后台轮询视频任务状态
-
-    轮询状态流转: QUEUED/APPROVED → PROCESSING → COMPLETED/FAILED
-    """
-    gt = await _load_tasks()
-    task = gt.get_task(task_id)
-    if not task:
-        return
-
-    # 优先使用 video_id 轮询，回退到 task_id
-    poll_id = task.video_id or task_id
-    poll_url = f"/agnesapi?video_id={poll_id}" if task.video_id else f"/v1/videos/{task_id}"
-
-    logger.info(f"开始轮询任务 {task_id} (video_id={task.video_id}, poll_url={poll_url}): {task.prompt}")
-
-    async with httpx.AsyncClient() as client:
-        for i in range(config.MAX_POLL_ATTEMPTS):
-            await asyncio.sleep(config.POLL_INTERVAL)
-
-            # 每次轮询前重新加载任务，检查是否已被取消或已达终态
-            gt = await _load_tasks()
-            task = gt.get_task(task_id)
-            if not task or _is_terminal_status(task.status):
-                logger.info(f"任务 {task_id} 已处于终态 {task.status.value if task else 'N/A'}，停止轮询")
-                return
-
-            # 重新计算 poll_url（task 对象的 video_id 可能在 approve 后被设置）
-            poll_id = task.video_id or task_id
-            poll_url = f"/agnesapi?video_id={poll_id}" if task.video_id else f"/v1/videos/{task_id}"
-
-            try:
-                data = await _req(client, "GET", poll_url)
-            except Exception as e:
-                logger.warning(f"轮询 {task_id} 第 {i + 1} 次失败: {e}")
-                continue
-
-            logger.info(f"轮询 {task_id} 第 {i + 1} 次响应: {json.dumps(data, ensure_ascii=False)[:300]}")
-
-            if data.get("error"):
-                await update_task_status(task_id, TaskStatus.FAILED, error_message=json.dumps(data["error"], ensure_ascii=False))
-                return
-
-            st = TaskStatus.from_api(data.get("status", ""))
-
-            # 非终态时同步更新本地状态（让 /agnes_info 能反映进度）
-            if not _is_terminal_status(st) and task.status != st:
-                task.status = st
-                # 重新加载 gt 确保不与 cancel/approve 冲突
-                gt = await _load_tasks()
-                gt.update_task(task_id, status=st)
-                await _save_tasks(gt)
-
-            if st == TaskStatus.COMPLETED:
-                urls = extract_video_urls(data)
-                await update_task_status(task_id, TaskStatus.COMPLETED, video_urls=urls)
-                return
-            if st == TaskStatus.FAILED:
-                err = data.get("error_message") or data.get("message") or "未知错误"
-                await update_task_status(task_id, TaskStatus.FAILED, error_message=str(err))
-                return
-
-            progress = data.get("progress")
-            logger.info(f"{task_id}: status={data.get('status')} progress={progress} ({i + 1}/{config.MAX_POLL_ATTEMPTS})")
-
-    await update_task_status(task_id, TaskStatus.FAILED, error_message="任务超时")
-
-
-# ---------------------------------------------------------------------------
-# 查询
-# ---------------------------------------------------------------------------
-
-
-async def get_video_task(task_id: str) -> Optional[VideoTask]:
-    gt = await _load_tasks()
-    return gt.get_task(task_id)
 
 
 async def cancel_current_video_task(chat_key: str) -> Optional[VideoTask]:
@@ -571,21 +439,266 @@ async def cancel_current_video_task(chat_key: str) -> Optional[VideoTask]:
         await _save_chat(chat_key, chat_data)
         return None
 
-    # 使用 REJECTED 而非 CANCELED（等同处理）
-    # 通过 update_task_status 确保后台轮询也能看到状态变化
-    await update_task_status(
-        chat_data.current_task_id,
-        TaskStatus.REJECTED,
-        error_message="用户取消",
-    )
+    await update_task_status(chat_data.current_task_id, TaskStatus.REJECTED, error_message="用户取消")
+    handle = task_api.get_handle(_TASK_TYPE, task.task_id)
+    if handle:
+        handle.notify("approval", False)
+    await task_api.cancel(_TASK_TYPE, task.task_id)
 
-    # 清理会话
     chat_data = await _load_chat(chat_key)
     if chat_data.current_task_id == task.task_id:
         chat_data.current_task_id = None
         await _save_chat(chat_key, chat_data)
 
     return task
+
+
+# ---------------------------------------------------------------------------
+# 视频任务 — 状态更新
+# ---------------------------------------------------------------------------
+
+
+def _is_terminal_status(status: TaskStatus) -> bool:
+    """是否为终态（不再轮询）"""
+    return status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.REJECTED)
+
+
+async def update_task_status(task_id: str, status: TaskStatus, **kwargs) -> None:
+    """更新任务状态，终态时清理会话。不允许从终态转移到其他状态。
+
+    通知消息由调用方（任务协程 / 命令处理器）负责发送。
+    """
+    gt = await _load_tasks()
+    existing = gt.get_task(task_id)
+    if not existing:
+        return
+    if _is_terminal_status(existing.status) and not _is_terminal_status(status):
+        logger.warning(f"任务 {task_id} 已是终态 {existing.status.value}，不允许更新为 {status.value}")
+        return
+    if not gt.update_task(task_id, status=status, **kwargs):
+        return
+    await _save_tasks(gt)
+
+    task = gt.get_task(task_id)
+    if not task:
+        return
+
+    if _is_terminal_status(status):
+        chat_data = await _load_chat(task.chat_key)
+        if chat_data.current_task_id == task_id:
+            chat_data.current_task_id = None
+            await _save_chat(task.chat_key, chat_data)
+
+    if status == TaskStatus.COMPLETED and task.video_urls:
+        chat_data = await _load_chat(task.chat_key)
+        chat_data.add_history(task.prompt, task.video_urls, task.task_id)
+        await _save_chat(task.chat_key, chat_data)
+
+
+# ---------------------------------------------------------------------------
+# 视频任务 — 异步任务协程（框架 TaskRunner 承载）
+# ---------------------------------------------------------------------------
+
+
+@plugin.mount_async_task(_TASK_TYPE)
+async def agnes_video_task(handle: AsyncTaskHandle, task_id: str):
+    """视频任务生命周期：审批等待 → API 提交 → 轮询 → 终态通知。"""
+    gt = await _load_tasks()
+    task = gt.get_task(task_id)
+    if not task:
+        yield TaskCtl.fail(f"任务 {task_id} 不存在")
+        return
+    if _is_terminal_status(task.status):
+        yield TaskCtl.cancel("任务已是终态")
+        return
+
+    # --- 审批阶段 ---
+    if task.status == TaskStatus.PENDING:
+        await _send_approval_request(task)
+        yield TaskCtl.report_progress("等待管理员审批")
+        try:
+            approved = await handle.wait("approval", timeout=config.APPROVAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            await update_task_status(task_id, TaskStatus.REJECTED, error_message="审批超时")
+            await handle.notify_agent(f"【视频生成已取消】\n任务ID: {task_id}\n审批超时，任务已拒绝。", trigger=False)
+            yield TaskCtl.fail("审批超时")
+            return
+        except asyncio.CancelledError:
+            return
+        gt = await _load_tasks()
+        task = gt.get_task(task_id)
+        if not task or _is_terminal_status(task.status):
+            yield TaskCtl.cancel("任务已终止")
+            return
+        if not approved:
+            if task.status != TaskStatus.REJECTED:
+                await update_task_status(task_id, TaskStatus.REJECTED, error_message="审批未通过")
+            yield TaskCtl.fail("审批被拒绝")
+            return
+        if task.status != TaskStatus.APPROVED:
+            await update_task_status(task_id, TaskStatus.APPROVED)
+
+    # --- 提交阶段 ---
+    if not task.video_id:
+        payload = build_video_payload(
+            task.prompt, task.model, task.mode, task.seconds, task.size, task.aspect_ratio,
+            seed=task.seed, first_frame=task.first_frame, last_frame=task.last_frame,
+            images=task.image_urls, audios=task.audio_urls, videos=task.video_refs,
+        )
+        try:
+            async with httpx.AsyncClient() as client:
+                created = await _req(client, "POST", "/v1/videos", payload)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"创建视频任务 API 调用失败: {error_msg}")
+            await update_task_status(task_id, TaskStatus.FAILED, error_message=error_msg)
+            await handle.notify_agent(
+                f"【视频生成失败】\n任务ID: {task_id}\n提示词: {task.prompt}\n错误信息: {error_msg}", trigger=True
+            )
+            yield TaskCtl.fail(error_msg)
+            return
+
+        api_video_id = created.get("video_id") or created.get("videoId") or created.get("id")
+        api_st = str(created.get("status", "")) if created.get("status") is not None else ""
+        if not api_video_id:
+            error_msg = f"API 未返回 video_id: {json.dumps(created, ensure_ascii=False)[:200]}"
+            await update_task_status(task_id, TaskStatus.FAILED, error_message=error_msg)
+            await handle.notify_agent(
+                f"【视频生成失败】\n任务ID: {task_id}\n提示词: {task.prompt}\n错误信息: {error_msg}", trigger=True
+            )
+            yield TaskCtl.fail(error_msg)
+            return
+        logger.info(f"视频任务已提交: {task_id} video_id={api_video_id} status={api_st}")
+        gt = await _load_tasks()
+        gt.update_task(task_id, video_id=api_video_id, status=TaskStatus.from_api(api_st) if api_st else TaskStatus.QUEUED)
+        await _save_tasks(gt)
+        yield TaskCtl.report_progress("任务已提交，等待生成")
+
+    # --- 轮询阶段 ---
+    async with httpx.AsyncClient() as client:
+        for i in range(config.MAX_POLL_ATTEMPTS):
+            await asyncio.sleep(config.POLL_INTERVAL)
+            if handle.is_cancelled:
+                yield TaskCtl.cancel("任务已取消")
+                return
+
+            gt = await _load_tasks()
+            task = gt.get_task(task_id)
+            if not task or _is_terminal_status(task.status):
+                logger.info(f"任务 {task_id} 已处于终态 {task.status.value if task else 'N/A'}，停止轮询")
+                yield TaskCtl.cancel("任务已终止")
+                return
+
+            try:
+                data = await _req(client, "GET", _poll_path(task.video_id, task.model))
+            except Exception as e:
+                logger.warning(f"轮询 {task_id} 第 {i + 1} 次失败: {e}")
+                continue
+
+            status_raw = str(data.get("status", "")).lower()
+
+            if status_raw == "completed":
+                urls = extract_video_urls(data)
+                if not urls:
+                    error_msg = f"任务完成但未找到视频 URL: {json.dumps(data, ensure_ascii=False)[:200]}"
+                    await update_task_status(task_id, TaskStatus.FAILED, error_message=error_msg)
+                    await handle.notify_agent(
+                        f"【视频生成失败】\n任务ID: {task_id}\n提示词: {task.prompt}\n错误信息: {error_msg}", trigger=True
+                    )
+                    yield TaskCtl.fail(error_msg)
+                    return
+                await update_task_status(task_id, TaskStatus.COMPLETED, video_urls=urls, progress=100)
+                msg = (
+                    f"【视频生成完成】\n任务ID: {task_id}\n提示词: {task.prompt}\n"
+                    f"视频已生成完毕!\n视频URL:\n" + "\n".join(urls) +
+                    "\n(use `send_msg_file` to send the video)"
+                )
+                await handle.notify_agent(msg, trigger=True)
+                yield TaskCtl.success("视频生成完成", data=urls)
+                return
+
+            if status_raw == "failed":
+                err = data.get("error") or data.get("error_message") or data.get("message") or "未知错误"
+                if isinstance(err, dict):
+                    err = err.get("message") or json.dumps(err, ensure_ascii=False)
+                err = str(err)
+                await update_task_status(task_id, TaskStatus.FAILED, error_message=err)
+                await handle.notify_agent(
+                    f"【视频生成失败】\n任务ID: {task_id}\n提示词: {task.prompt}\n错误信息: {err}", trigger=True
+                )
+                yield TaskCtl.fail(err)
+                return
+
+            st = TaskStatus.from_api(status_raw)
+            progress = _parse_progress(data.get("progress"))
+            gt = await _load_tasks()
+            gt.update_task(task_id, status=st, progress=progress)
+            await _save_tasks(gt)
+            yield TaskCtl.report_progress(f"生成中: {status_raw or st.value} {progress}%", percent=progress)
+
+    error_msg = "任务超时"
+    await update_task_status(task_id, TaskStatus.FAILED, error_message=error_msg)
+    await handle.notify_agent(
+        f"【视频生成失败】\n任务ID: {task_id}\n提示词: {task.prompt}\n错误信息: {error_msg}", trigger=True
+    )
+    yield TaskCtl.fail(error_msg)
+
+
+def _parse_progress(value: Any) -> int:
+    try:
+        p = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if p <= 1:
+        p *= 100
+    return max(0, min(100, int(p)))
+
+
+async def _send_approval_request(task: VideoTask) -> None:
+    manager_msg = (
+        f"【视频生成申请】\n任务ID: {task.task_id}\n会话: {task.chat_key}\n"
+        f"提示词: {task.prompt}\n模型: {task.model}\n模式: {task.mode}\n"
+        f"时长: {task.seconds}s 尺寸: {task.size} 比例: {task.aspect_ratio}\n"
+    )
+    if task.reason:
+        manager_msg += f"原因: {task.reason}\n"
+    manager_msg += (
+        f"批准: /agnes_y {task.task_id}\n"
+        f"拒绝: /agnes_n {task.task_id}"
+    )
+    try:
+        target = config.MANAGER_CHAT_KEY or task.chat_key
+        await push_system(chat_key=target, message=manager_msg)
+    except Exception as e:
+        logger.error(f"发送审批消息失败: {e}")
+
+
+async def recover_unfinished_tasks() -> int:
+    """插件启动时恢复未到终态的视频任务。返回恢复数量。"""
+    gt = await _load_tasks()
+    recovered = 0
+    for t in gt.get_all_tasks():
+        if _is_terminal_status(t.status):
+            continue
+        if task_api.is_running(_TASK_TYPE, t.task_id):
+            continue
+        try:
+            await task_api.start(_TASK_TYPE, t.task_id, t.chat_key, plugin, t.task_id)
+            recovered += 1
+            logger.info(f"恢复视频任务轮询: {t.task_id} (status={t.status.value})")
+        except ValueError as e:
+            logger.warning(f"恢复任务 {t.task_id} 失败: {e}")
+    return recovered
+
+
+# ---------------------------------------------------------------------------
+# 查询
+# ---------------------------------------------------------------------------
+
+
+async def get_video_task(task_id: str) -> Optional[VideoTask]:
+    gt = await _load_tasks()
+    return gt.get_task(task_id)
 
 
 def format_task_info(task: VideoTask) -> str:
@@ -596,9 +709,11 @@ def format_task_info(task: VideoTask) -> str:
     info = (
         f"任务ID: {task.task_id}\n会话: {task.chat_key}\n提示词: {task.prompt}\n"
         f"状态: {task.status.value}\n模型: {task.model}\n"
-        f"尺寸: {task.width}x{task.height}\n帧数: {task.num_frames}\n帧率: {task.frame_rate}\n"
+        f"模式: {task.mode}\n时长: {task.seconds}s\n分辨率: {task.size}\n比例: {task.aspect_ratio}\n"
         f"创建时间: {create_time}\n更新时间: {update_time}\n"
     )
+    if task.status in (TaskStatus.QUEUED, TaskStatus.PROCESSING) and task.progress:
+        info += f"进度: {task.progress}%\n"
     if task.reason:
         info += f"原因: {task.reason}\n"
     if task.video_urls:

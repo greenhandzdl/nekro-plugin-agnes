@@ -11,11 +11,7 @@ from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.services.plugin.base import SandboxMethodType
 
 from .conf import config, plugin
-
-
-def _headers() -> dict[str, str]:
-    from .service import _key
-    return {"Authorization": f"Bearer {_key()}", "Content-Type": "application/json"}
+from .service import _get_base_url, _hdrs, _normalize_text_model, _req
 
 
 @plugin.mount_sandbox_method(
@@ -83,7 +79,7 @@ async def generate_text(
         messages.append({"role": "user", "content": prompt})
 
     payload: Dict[str, Any] = {
-        "model": config.TEXT_MODEL, "messages": messages,
+        "model": _normalize_text_model(config.TEXT_MODEL), "messages": messages,
         "temperature": temperature, "max_tokens": max_tokens,
     }
     if stream:
@@ -105,7 +101,6 @@ async def generate_text(
 
 async def _handle_stream(client: httpx.AsyncClient, payload: Dict[str, Any]) -> str:
     """处理流式文本响应（SSE）。"""
-    from .service import _get_base_url
     base = _get_base_url()
     url = f"{base}/v1/chat/completions"
     content_parts: List[str] = []
@@ -113,7 +108,7 @@ async def _handle_stream(client: httpx.AsyncClient, payload: Dict[str, Any]) -> 
     done = False
     raw_chunks: List[str] = []
 
-    async with client.stream("POST", url, json=payload, headers=_headers(), timeout=config.TIMEOUT) as resp:
+    async with client.stream("POST", url, json=payload, headers=_hdrs(), timeout=config.TIMEOUT) as resp:
         resp.raise_for_status()
         async for line in resp.aiter_lines():
             line = line.strip()
@@ -138,8 +133,3 @@ async def _handle_stream(client: httpx.AsyncClient, payload: Dict[str, Any]) -> 
         "type": "text-stream", "content": "".join(content_parts) or None,
         "events": event_count, "done": done, "raw_prefix": "\n".join(raw_chunks)[:200],
     }, ensure_ascii=False, indent=2)
-
-
-async def _req(client: httpx.AsyncClient, method: str, path: str, payload: Optional[Dict] = None) -> Dict[str, Any]:
-    from .service import _req as svc_req
-    return await svc_req(client, method, path, payload)

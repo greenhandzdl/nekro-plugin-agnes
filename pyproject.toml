@@ -1,14 +1,14 @@
 [project]
 name = "nekro-plugin-agnes"
-version = "1.1.0"
-description = "Agnes AI 文本、图片、视频生成插件"
+version = "2.0.0"
+description = "Agnes AI 文本、图片、视频生成插件（Video 2.5 系列 + 框架命令/任务系统）"
 authors = [{ name = "greenhandzdl", email = "greenhandzdl@gmail.com" }]
 readme = "README.md"
-requires-python = ">=3.10,<3.12"
-dependencies = ["nekro-agent>=2.0.0", "httpx", "nonebot2", "nonebot2[fastapi]"]
+requires-python = ">=3.10"
+dependencies = ["nekro-agent>=2.4.0", "httpx"]
 
 [project.urls]
-Repository = "https://github.com/Yacey/agnes-ai-generation-skill"
+Repository = "https://github.com/greenhandzdl/nekro-plugin-agnes"
 
 [build-system]
 requires = ["hatchling"]

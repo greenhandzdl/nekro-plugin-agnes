@@ -1,8 +1,8 @@
-"""数据模型定义"""
+"""数据模型定义 — 对齐 Agnes Video 2.5 系列接口"""
 
 import time
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -14,14 +14,13 @@ class TaskStatus(str, Enum):
 
     流转:
     创建 → PENDING (需审批) / QUEUED (不需审批)
-    PENDING → APPROVED (审批通过) / REJECTED (审批拒绝)
+    PENDING → APPROVED (审批通过) / REJECTED (审批拒绝/超时)
     APPROVED → PROCESSING (API 开始生成)
-    PROCESSING → COMPLETED (生成完成) / FAILED (生成失败)
-    QUEUED → PROCESSING → COMPLETED / FAILED
+    QUEUED → PROCESSING → COMPLETED (生成完成) / FAILED (生成失败)
     """
 
     PENDING = "pending"       # 等待管理员审批
-    APPROVED = "approved"     # 已批准，准备/正在执行
+    APPROVED = "approved"     # 已批准，准备提交 API
     REJECTED = "rejected"     # 已拒绝（等同 CANCELED）
     QUEUED = "queued"         # 在队列中等待处理（API 初始状态）
     PROCESSING = "processing"  # 正在生成
@@ -30,15 +29,17 @@ class TaskStatus(str, Enum):
 
     @classmethod
     def from_api(cls, status: str) -> "TaskStatus":
-        """从 API 返回的状态字符串转换"""
+        """从 API 返回的状态字符串转换（忽略 internal_status/internal_progress）"""
         mapping = {
             "queued": cls.QUEUED,
+            "pending": cls.QUEUED,
             "in_progress": cls.PROCESSING,
             "processing": cls.PROCESSING,
             "completed": cls.COMPLETED,
+            "succeeded": cls.COMPLETED,
             "failed": cls.FAILED,
         }
-        return mapping.get(status.lower(), cls.PROCESSING)
+        return mapping.get((status or "").lower(), cls.PROCESSING)
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +48,7 @@ class TaskStatus(str, Enum):
 
 
 class VideoTask(BaseModel):
-    """视频生成任务"""
+    """视频生成任务（agnes-video-2.5 / agnes-video-2.5-flash）"""
 
     task_id: str
     chat_key: str
@@ -57,16 +58,20 @@ class VideoTask(BaseModel):
     video_id: Optional[str] = None      # API 返回的 video_id，用于轮询
     video_urls: List[str] = Field(default_factory=list)
     error_message: Optional[str] = None
+    progress: int = 0
     create_time: int = 0
     update_time: int = 0
     model: str = ""
-    height: int = 768
-    width: int = 1152
-    num_frames: int = 121
-    frame_rate: float = 24
-    image_url: Optional[str] = None
-    image_urls: Optional[List[str]] = None
-    mode: Optional[str] = None
+    mode: str = "text"                  # text | keyframe | reference
+    seconds: str = "5"                  # "4"-"12"
+    size: str = "720P"                  # 720P | 1080P | 1K | 2K（flash 仅 720P）
+    aspect_ratio: str = "16:9"
+    seed: Optional[int] = None
+    first_frame: Optional[str] = None   # keyframe 模式首帧
+    last_frame: Optional[str] = None    # keyframe 模式尾帧
+    image_urls: Optional[List[str]] = None   # reference 模式参考图片
+    audio_urls: Optional[List[str]] = None   # reference 模式参考音频
+    video_refs: Optional[List[Dict[str, Any]]] = None  # reference 模式参考视频对象
 
     @classmethod
     def create(
@@ -76,13 +81,16 @@ class VideoTask(BaseModel):
         prompt: str,
         reason: Optional[str] = None,
         model: str = "",
-        height: int = 768,
-        width: int = 1152,
-        num_frames: int = 121,
-        frame_rate: float = 24,
-        image_url: Optional[str] = None,
+        mode: str = "text",
+        seconds: str = "5",
+        size: str = "720P",
+        aspect_ratio: str = "16:9",
+        seed: Optional[int] = None,
+        first_frame: Optional[str] = None,
+        last_frame: Optional[str] = None,
         image_urls: Optional[List[str]] = None,
-        mode: Optional[str] = None,
+        audio_urls: Optional[List[str]] = None,
+        video_refs: Optional[List[Dict[str, Any]]] = None,
     ) -> "VideoTask":
         """创建一个新的视频任务"""
         now = int(time.time())
@@ -95,13 +103,16 @@ class VideoTask(BaseModel):
             create_time=now,
             update_time=now,
             model=model,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            image_url=image_url,
-            image_urls=image_urls,
             mode=mode,
+            seconds=seconds,
+            size=size,
+            aspect_ratio=aspect_ratio,
+            seed=seed,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            image_urls=image_urls,
+            audio_urls=audio_urls,
+            video_refs=video_refs,
         )
 
 

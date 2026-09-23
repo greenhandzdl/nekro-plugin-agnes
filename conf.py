@@ -5,7 +5,7 @@ plugin = NekroPlugin(
     name="Agnes AI Generation",
     module_name="agnes_ai_generation",
     description="通过 Agnes AI API 进行文本、图片和视频生成",
-    version="1.1.0",
+    version="2.0.0",
     author="greenhandzdl",
     url="https://github.com/greenhandzdl/nekro-plugin-agnes",
 )
@@ -31,29 +31,34 @@ class AgnesConfig(ConfigBase):
         description="API 请求的超时时间（秒）",
     )
     TEXT_MODEL: str = Field(
-        default="agnes-2.0-flash",
+        default="agnes-2.5-flash",
         title="文本模型",
-        description="文本生成使用的模型名称",
+        description="文本生成使用的模型名称，可选: agnes-2.5-flash / agnes-3.0-flash / agnes-2.5-pro",
     )
     IMAGE_MODEL: str = Field(
-        default="agnes-image-2.1-flash",
+        default="agnes-image-2.5-flash",
         title="图片模型",
-        description="图片生成/编辑使用的模型名称",
+        description="图片生成/编辑使用的模型名称，可选: agnes-image-2.5-flash / agnes-image-2.1-flash / agnes-image-2.0-flash",
     )
     VIDEO_MODEL: str = Field(
-        default="agnes-video-v2.0",
+        default="agnes-video-2.5-flash",
         title="视频模型",
-        description="视频生成使用的模型名称",
+        description="视频生成使用的模型名称。agnes-video-2.5-flash 限时免费（仅 720P、不支持视频参考）；agnes-video-2.5 付费（支持参考视频、最高 2K）。agnes-video-v2.0 已于 2026-09-25 下线",
     )
     POLL_INTERVAL: int = Field(
-        default=10,
+        default=2,
         title="轮询间隔",
-        description="视频任务状态轮询间隔（秒）",
+        description="视频任务状态轮询间隔（秒），官方建议 1-2 秒",
     )
     MAX_POLL_ATTEMPTS: int = Field(
-        default=60,
+        default=300,
         title="最大轮询次数",
-        description="视频任务状态查询的最大次数，默认 60 次（约 10 分钟）",
+        description="视频任务状态查询的最大次数，默认 300 次（间隔 2 秒约 10 分钟）",
+    )
+    APPROVAL_TIMEOUT: int = Field(
+        default=86400,
+        title="审批超时时间",
+        description="视频任务等待管理员审批的最长时间（秒），超时后任务自动拒绝",
     )
     DISABLE_TEXT_GENERATION: bool = Field(
         default=False,
